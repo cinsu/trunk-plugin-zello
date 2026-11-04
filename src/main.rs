@@ -4,7 +4,8 @@
 //! Each stream logs a Zello account on to a channel and keeps it connected.
 //! Its system's talkgroup (or all of the system) goes to the channel live, a
 //! transmission at a time, and how each stream is doing shows next to the
-//! plugin and on its dashboard.
+//! plugin and on its dashboard. Pages the recorder recognizes (its signals)
+//! can post a text to the stream's channel and to other channels.
 
 mod audio;
 mod token;
@@ -16,8 +17,10 @@ use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use trunk_recorder_plugin::{
-    AudioChunk, CallInfo, ConcludedCall, Endpoint, EndpointState, Host, Manifest, Metrics, NoConfig, Outcome, Plugin, Setup, State, topic,
+    AudioChunk, CallInfo, ConcludedCall, Contribution, Endpoint, EndpointState, Host, Manifest, Metrics, NoConfig, Outcome, Plugin, Setup, State,
+    TonePatternEvent, topic,
 };
 
 use token::TokenMaker;
@@ -62,6 +65,21 @@ struct Config {
     /// Each sends a system's talkgroup (or all of it) to a Zello channel,
     /// with a Zello account of its own.
     streams: Vec<StreamConfig>,
+    /// Page alerts
+    ///
+    /// When the recorder hears one of these pages (its signals), a text goes
+    /// to Zello: "🔔 Page for <name>". Add one here, or with "Zello alert" on
+    /// a signal in Setup.
+    alerts: Vec<AlertConfig>,
+    /// Alert account: username
+    ///
+    /// Only for alerts to other channels: the Zello account that posts them,
+    /// joined to all of those channels. Consumer Zello lets an account join
+    /// one channel at a time, so there it can post to one other channel.
+    alert_username: String,
+    /// Alert account: password
+    #[schemars(extend("x-secret" = true))]
+    alert_password: String,
     /// For tests: another Zello address. Not in the settings form.
     #[schemars(skip)]
     server: String,
@@ -94,6 +112,52 @@ struct StreamConfig {
     password: String,
 }
 
+/// Page alert
+#[derive(Serialize, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase", default)]
+#[schemars(extend("x-title" = "name"))]
+struct AlertConfig {
+    /// Name
+    ///
+    /// What the alert says: "🔔 Page for <name>".
+    name: String,
+    /// Pages
+    ///
+    /// The signals it's for.
+    #[schemars(extend("x-signals" = true))]
+    signals: Vec<String>,
+    /// Post on the stream's channel
+    ///
+    /// The channel of each stream that carries the page's talkgroup.
+    to_stream: bool,
+    /// Also post to
+    ///
+    /// Other Zello channels, posted to by the alert account.
+    channels: Vec<String>,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        AlertConfig { name: String::new(), signals: Vec::new(), to_stream: true, channels: Vec::new() }
+    }
+}
+
+/// An alert, checked.
+struct Alert {
+    name: String,
+    signals: Vec<String>,
+    to_stream: bool,
+    channels: Vec<String>,
+}
+
+/// What to connect, checked.
+struct Plan {
+    streams: Vec<Planned>,
+    alerts: Vec<Alert>,
+    /// The alert account's connection, when alerts go to other channels.
+    alert_link: Option<LinkConfig>,
+}
+
 /// A stream, checked and ready to connect.
 struct Planned {
     name: String,
@@ -103,7 +167,7 @@ struct Planned {
 }
 
 /// Checks the settings; what to connect, or what to fix.
-fn plan(c: &Config, systems: &[String]) -> Result<Vec<Planned>, String> {
+fn plan(c: &Config, systems: &[String]) -> Result<Plan, String> {
     if c.streams.is_empty() {
         return Err("Add a stream: the system and talkgroup to send, and the Zello channel and account to send it with.".into());
     }
@@ -137,6 +201,7 @@ fn plan(c: &Config, systems: &[String]) -> Result<Vec<Planned>, String> {
             link: LinkConfig {
                 url: url.clone(),
                 channel: s.channel.trim().to_string(),
+                also: Vec::new(),
                 username: s.username.trim().to_string(),
                 password: s.password.clone(),
                 tokens: tokens.clone(),
@@ -146,7 +211,50 @@ fn plan(c: &Config, systems: &[String]) -> Result<Vec<Planned>, String> {
             },
         });
     }
-    Ok(planned)
+    let mut alerts = Vec::new();
+    let mut alert_channels: Vec<String> = Vec::new();
+    for (i, a) in c.alerts.iter().enumerate() {
+        let name = if a.name.trim().is_empty() { format!("Page alert {}", i + 1) } else { a.name.trim().to_string() };
+        let signals: Vec<String> = a.signals.iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        if signals.is_empty() {
+            return Err(format!("{name}: tick the page (signal) it's for."));
+        }
+        let channels: Vec<String> = a.channels.iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        if !a.to_stream && channels.is_empty() {
+            return Err(format!("{name}: post it on the stream's channel, or add a channel to post it to."));
+        }
+        for ch in &channels {
+            if !alert_channels.iter().any(|x| x.eq_ignore_ascii_case(ch)) {
+                alert_channels.push(ch.clone());
+            }
+        }
+        alerts.push(Alert { name, signals, to_stream: a.to_stream, channels });
+    }
+    let alert_link = if alert_channels.is_empty() {
+        None
+    } else {
+        if c.alert_username.trim().is_empty() || c.alert_password.trim().is_empty() {
+            return Err("Page alerts to other channels need the alert account: add its username and password.".into());
+        }
+        if c.service == Service::Consumer && alert_channels.len() > 1 {
+            return Err(format!(
+                "Consumer Zello lets an account join one channel at a time, but the alerts post to {} other channels ({}). Use one, or Zello Work.",
+                alert_channels.len(),
+                alert_channels.join(", ")
+            ));
+        }
+        Some(LinkConfig {
+            url,
+            channel: alert_channels[0].clone(),
+            also: alert_channels[1..].to_vec(),
+            username: c.alert_username.trim().to_string(),
+            password: c.alert_password.clone(),
+            tokens,
+            network,
+            start_delay: Duration::from_secs(3 * c.streams.len() as u64),
+        })
+    };
+    Ok(Plan { streams: planned, alerts, alert_link })
 }
 
 /// "wahkiakum", from what people paste: "Wahkiakum", "wahkiakum.zellowork.com", a URL.
@@ -182,6 +290,8 @@ struct Entry {
     heard: u64,
     sent: u64,
     failed: u64,
+    /// Page alerts posted.
+    posted: u64,
     queued: usize,
     streaming: bool,
     /// From a call's start to Zello taking it, ms, smoothed.
@@ -211,9 +321,9 @@ impl Board {
             LinkState::Down(why) | LinkState::Refused(why) => why.clone(),
         };
         let mut counts = Vec::new();
-        for (n, what) in [(e.heard, "heard"), (e.sent, "sent"), (e.failed, "failed")] {
+        for (n, what) in [(e.heard, "heard"), (e.sent, "sent"), (e.failed, "failed"), (e.posted, "pages posted")] {
             if n > 0 {
-                counts.push(format!("{n} {what}"));
+                counts.push(if n == 1 && what == "pages posted" { "1 page posted".to_string() } else { format!("{n} {what}") });
             }
         }
         let counts = if counts.is_empty() { String::new() } else { format!(" · {}", counts.join(" · ")) };
@@ -265,6 +375,7 @@ impl Board {
         m.extra.insert("transmissions heard".into(), sum(|e| e.heard).into());
         m.extra.insert("transmissions sent".into(), sum(|e| e.sent).into());
         m.extra.insert("transmissions failed".into(), sum(|e| e.failed).into());
+        m.extra.insert("page alerts posted".into(), sum(|e| e.posted).into());
         host.metrics(&m);
     }
 
@@ -293,6 +404,9 @@ struct TrProZello {
     board: Arc<Mutex<Board>>,
     routes: Vec<Route>,
     links: Vec<Link>,
+    alerts: Vec<Alert>,
+    /// The alert account's connection: an index into `links`.
+    alert_link: Option<usize>,
     /// Calls being sent, and the streams they go to.
     calls: HashMap<u32, Vec<usize>>,
     /// Calls that just ended, so audio arriving after its end isn't taken for a new call.
@@ -322,14 +436,22 @@ impl Plugin for TrProZello {
     fn manifest() -> Manifest {
         Manifest {
             name: "Zello".into(),
-            subscribe: vec![topic::CALL_START.into(), topic::AUDIO.into(), topic::CALL_END.into(), topic::CALL_CONCLUDED.into()],
+            subscribe: vec![topic::CALL_START.into(), topic::AUDIO.into(), topic::CALL_END.into(), topic::CALL_CONCLUDED.into(), topic::TONE_PATTERN.into()],
+            // A button on each of a system's signals in Setup: adds a page alert for it.
+            contribute: vec![Contribution {
+                on: "signal".into(),
+                label: "Zello alert".into(),
+                hint: "Post a text to Zello when this page is heard".into(),
+                append: "alerts".into(),
+                item: json!({ "name": "{name}", "signals": ["{signal}"], "toStream": true }),
+            }],
             ..trunk_recorder_plugin::manifest!()
         }
     }
 
     fn start(host: Host, setup: Setup<Config, NoConfig>) -> Result<Self, String> {
         let systems: Vec<String> = setup.systems.iter().map(|s| s.short_name.clone()).collect();
-        let planned = plan(&setup.config, &systems)?;
+        let Plan { streams: planned, alerts, alert_link } = plan(&setup.config, &systems)?;
         let users: Vec<&str> = planned.iter().map(|p| p.link.username.as_str()).collect();
         for (i, u) in users.iter().enumerate() {
             if users[..i].contains(u) {
@@ -340,16 +462,21 @@ impl Plugin for TrProZello {
             Service::Consumer => "Zello".to_string(),
             Service::Work => format!("Zello Work network {}", planned[0].link.network.as_deref().unwrap_or_default()),
         };
+        let mut entries: Vec<(String, String)> = planned.iter().map(|p| (p.name.clone(), p.link.channel.clone())).collect();
+        if let Some(l) = &alert_link {
+            entries.push(("Page alerts".into(), channels_label(l)));
+        }
         let board = Arc::new(Mutex::new(Board {
-            streams: planned
-                .iter()
-                .map(|p| Entry {
-                    name: p.name.clone(),
-                    channel: p.link.channel.clone(),
+            streams: entries
+                .into_iter()
+                .map(|(name, channel)| Entry {
+                    name,
+                    channel,
                     state: LinkState::Connecting,
                     heard: 0,
                     sent: 0,
                     failed: 0,
+                    posted: 0,
                     queued: 0,
                     streaming: false,
                     delay_ms: None,
@@ -367,48 +494,44 @@ impl Plugin for TrProZello {
             let tg = p.talkgroup.map_or("every talkgroup".to_string(), |t| format!("talkgroup {t}"));
             host.info(format!("{}: {} {tg} → {service}, channel '{}', as {}", p.name, p.system, p.link.channel, p.link.username));
             routes.push(Route { system: p.system, talkgroup: p.talkgroup, stream: i });
-            let (h, b) = (host.clone(), board.clone());
-            let report: zello::Report = Arc::new(move |event: Event| {
-                let mut b = b.lock().unwrap();
-                let e = &mut b.streams[i];
-                match event {
-                    Event::State(state) => {
-                        match &state {
-                            LinkState::Online { users } if !matches!(e.state, LinkState::Online { .. }) => {
-                                h.info(format!("{}: connected to Zello channel '{}' ({users} online)", e.name, e.channel));
-                            }
-                            LinkState::Down(why) | LinkState::Refused(why) => h.warn(format!("{}: {why}", e.name)),
-                            _ => {}
-                        }
-                        e.state = state;
-                    }
-                    Event::Load { queued, streaming } => (e.queued, e.streaming) = (queued, streaming),
-                    Event::Note(text) => h.warn(format!("{}: {text}", e.name)),
-                    Event::Done { call, outcome, why, took, waited } => {
-                        match outcome {
-                            Outcome::Ok => {
-                                e.sent += 1;
-                                e.last_ok = Some(unix_now());
-                                let ms = waited.as_secs_f64() * 1000.0;
-                                e.delay_ms = Some(e.delay_ms.map_or(ms, |d| d * 0.8 + ms * 0.2));
-                            }
-                            Outcome::Failed => {
-                                e.failed += 1;
-                                e.last_error = Some((unix_now(), why.clone()));
-                                h.warn(format!("{}: a transmission wasn't sent: {why}", e.name));
-                            }
-                            Outcome::Skipped => {}
-                        }
-                        let p = b.pending.entry((i, call)).or_default();
-                        p.result = Some((outcome, why, took));
-                        b.settle(&h, (i, call));
-                    }
-                }
-                b.publish(&h);
-            });
-            links.push(Link::start(p.link, report));
+            links.push(Link::start(p.link, reporter(i, &host, &board)));
         }
-        Ok(TrProZello { host, board, routes, links, calls: HashMap::new(), ended: Default::default() })
+        let alert_link = alert_link.map(|l| {
+            let i = links.len();
+            host.info(format!("Page alerts: posted to {} as {}", channels_label(&l), l.username));
+            links.push(Link::start(l, reporter(i, &host, &board)));
+            i
+        });
+        for a in &alerts {
+            let mut to: Vec<String> = a.channels.iter().map(|c| format!("'{c}'")).collect();
+            if a.to_stream {
+                to.insert(0, "the stream's channel".into());
+            }
+            host.info(format!("Page alert {}: {} → {}", a.name, a.signals.join(", "), to.join(", ")));
+        }
+        Ok(TrProZello { host, board, routes, links, alerts, alert_link, calls: HashMap::new(), ended: Default::default() })
+    }
+
+    fn tone_pattern(&mut self, t: TonePatternEvent) {
+        let heard: Vec<String> = t.pattern.signals.iter().map(|id| format!("{}:{id}", t.short_name)).collect();
+        if heard.is_empty() {
+            return;
+        }
+        let streams = self.streams_for(&t.short_name, t.talkgroup);
+        for a in self.alerts.iter().filter(|a| a.signals.iter().any(|s| heard.contains(s))) {
+            let text = format!("🔔 Page for {}", a.name);
+            self.host.info(format!("Page heard: {} (talkgroup {})", a.name, t.talkgroup));
+            if a.to_stream {
+                for &s in &streams {
+                    self.links[s].send(Cmd::Text { channel: None, text: text.clone() });
+                }
+            }
+            if let Some(l) = self.alert_link {
+                for ch in &a.channels {
+                    self.links[l].send(Cmd::Text { channel: Some(ch.clone()), text: text.clone() });
+                }
+            }
+        }
     }
 
     fn call_start(&mut self, call: CallInfo) {
@@ -479,6 +602,61 @@ impl Plugin for TrProZello {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// What a connection reports, put on the board: `i` is its place there.
+fn reporter(i: usize, host: &Host, board: &Arc<Mutex<Board>>) -> zello::Report {
+    let (h, b) = (host.clone(), board.clone());
+    Arc::new(move |event: Event| {
+        let mut b = b.lock().unwrap();
+        let e = &mut b.streams[i];
+        match event {
+            Event::State(state) => {
+                match &state {
+                    LinkState::Online { users } if !matches!(e.state, LinkState::Online { .. }) => {
+                        h.info(format!("{}: connected to Zello channel '{}' ({users} online)", e.name, e.channel));
+                    }
+                    LinkState::Down(why) | LinkState::Refused(why) => h.warn(format!("{}: {why}", e.name)),
+                    _ => {}
+                }
+                e.state = state;
+            }
+            Event::Load { queued, streaming } => (e.queued, e.streaming) = (queued, streaming),
+            Event::Note(text) => h.warn(format!("{}: {text}", e.name)),
+            Event::Posted { channel, ok, why } => {
+                if ok {
+                    e.posted += 1;
+                } else {
+                    h.warn(format!("{}: a page alert wasn't posted to '{channel}': {why}", e.name));
+                }
+            }
+            Event::Done { call, outcome, why, took, waited } => {
+                match outcome {
+                    Outcome::Ok => {
+                        e.sent += 1;
+                        e.last_ok = Some(unix_now());
+                        let ms = waited.as_secs_f64() * 1000.0;
+                        e.delay_ms = Some(e.delay_ms.map_or(ms, |d| d * 0.8 + ms * 0.2));
+                    }
+                    Outcome::Failed => {
+                        e.failed += 1;
+                        e.last_error = Some((unix_now(), why.clone()));
+                        h.warn(format!("{}: a transmission wasn't sent: {why}", e.name));
+                    }
+                    Outcome::Skipped => {}
+                }
+                let p = b.pending.entry((i, call)).or_default();
+                p.result = Some((outcome, why, took));
+                b.settle(&h, (i, call));
+            }
+        }
+        b.publish(&h);
+    })
+}
+
+/// "District 4" or "3 channels".
+fn channels_label(l: &LinkConfig) -> String {
+    if l.also.is_empty() { l.channel.clone() } else { format!("{} channels", l.also.len() + 1) }
 }
 
 fn main() {

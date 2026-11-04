@@ -20,7 +20,8 @@ if not m.get("repository") or (release and "YOUR-NAME" in m["repository"]):
     problems.append("repository: your plugin's GitHub URL, in Cargo.toml")
 if not m.get("subscribe"):
     problems.append("subscribe: a plugin that subscribes to nothing never hears anything")
-known = {"call.start", "call.end", "call.concluded", "unit", "audio", "status"}
+# tone_pattern: Trunk Recorder Pro's pages and other tone patterns.
+known = {"call.start", "call.end", "call.concluded", "unit", "audio", "status", "tone_pattern"}
 for t in m.get("subscribe", []):
     if t not in known:
         problems.append(f"subscribe: unknown topic {t!r}")

@@ -7,7 +7,7 @@
 //! a `logon` command, then `on_channel_status` events.
 //! <https://github.com/zelloptt/zello-channel-api/blob/master/API.md>
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +71,12 @@ pub enum Event {
         queued: usize,
         streaming: bool,
     },
+    /// A text (a page alert) went to a channel, or didn't.
+    Posted {
+        channel: String,
+        ok: bool,
+        why: String,
+    },
     /// Something worth a line in the log.
     Note(String),
 }
@@ -78,9 +84,22 @@ pub enum Event {
 /// What the plugin tells a connection.
 #[derive(Debug)]
 pub enum Cmd {
-    Start { call: u32 },
-    Audio { call: u32, rate: u32, samples: Vec<i16> },
-    End { call: u32 },
+    Start {
+        call: u32,
+    },
+    Audio {
+        call: u32,
+        rate: u32,
+        samples: Vec<i16>,
+    },
+    End {
+        call: u32,
+    },
+    /// A text for a channel: `None` is the connection's own channel.
+    Text {
+        channel: Option<String>,
+        text: String,
+    },
 }
 
 /// What a connection needs. The password and token maker stay in here:
@@ -88,6 +107,9 @@ pub enum Cmd {
 pub struct LinkConfig {
     pub url: String,
     pub channel: String,
+    /// More channels to join, for texts only (page alerts). Only Zello Work
+    /// lets one connection join several.
+    pub also: Vec<String>,
     pub username: String,
     pub password: String,
     /// Consumer Zello signs a token for each logon; Zello Work doesn't.
@@ -176,6 +198,8 @@ impl Tx {
 struct Pipeline {
     rx: Receiver<Cmd>,
     queue: VecDeque<Tx>,
+    /// Texts waiting to go: when they came, the channel (`None`: the connection's own), the text.
+    texts: VecDeque<(Instant, Option<String>, String)>,
     load: (usize, bool),
     dropped: usize,
     noted_rate: bool,
@@ -183,7 +207,7 @@ struct Pipeline {
 
 impl Pipeline {
     fn new(rx: Receiver<Cmd>) -> Pipeline {
-        Pipeline { rx, queue: VecDeque::new(), load: (0, false), dropped: 0, noted_rate: false }
+        Pipeline { rx, queue: VecDeque::new(), texts: VecDeque::new(), load: (0, false), dropped: 0, noted_rate: false }
     }
 
     /// Takes what the plugin sent.
@@ -221,6 +245,7 @@ impl Pipeline {
                         tx.end();
                     }
                 }
+                Cmd::Text { channel, text } => self.texts.push_back((Instant::now(), channel, text)),
             }
         }
     }
@@ -243,6 +268,11 @@ impl Pipeline {
             if !tx.ended && tx.last_audio.elapsed() > SILENT_END {
                 tx.end();
             }
+        }
+        while self.texts.front().is_some_and(|t| t.0.elapsed() > MAX_WAIT) {
+            let (_, channel, _) = self.texts.pop_front().expect("checked");
+            let channel = channel.unwrap_or_default();
+            report(Event::Posted { channel, ok: false, why: "Zello wasn't connected".into() });
         }
     }
 
@@ -380,7 +410,7 @@ fn converse(
         "seq": 1,
         "username": cfg.username,
         "password": cfg.password,
-        "channels": [cfg.channel],
+        "channels": channels(cfg),
         "version": concat!("tr-pro-zello ", env!("CARGO_PKG_VERSION")),
         "platform_type": "trunk-recorder-pro",
         // Zello Alarms watches clients whose platform name says "Gateway".
@@ -395,6 +425,9 @@ fn converse(
     let mut logged_on = false;
     let mut online = false;
     let mut seq: u64 = 1;
+    // Channels online, with their users; texts sent, by seq, to their channel.
+    let mut joined: HashMap<String, u64> = HashMap::new();
+    let mut texts_sent: HashMap<u64, String> = HashMap::new();
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = ws.close(None);
@@ -412,16 +445,25 @@ fn converse(
                     } else {
                         return Err(refusal(cfg, v["error"].as_str().unwrap_or("no reason given")));
                     }
-                } else if v["command"] == "on_channel_status" && same_channel(&v, &cfg.channel) {
+                } else if v["command"] == "on_channel_status"
+                    && let Some(channel) = our_channel(&v, cfg)
+                {
                     if v["status"] == "online" {
-                        online = true;
-                        online_since.get_or_insert_with(Instant::now);
-                        report(Event::State(LinkState::Online { users: v["users_online"].as_u64().unwrap_or(0) }));
+                        joined.insert(channel, v["users_online"].as_u64().unwrap_or(0));
+                        if joined.len() == channels(cfg).len() {
+                            online = true;
+                            online_since.get_or_insert_with(Instant::now);
+                            report(Event::State(LinkState::Online { users: joined.values().sum() }));
+                        }
                     } else if let Some(err) = v["error"].as_str() {
-                        return Err(channel_refusal(cfg, err, v["error_type"] == "configuration"));
+                        return Err(channel_refusal(cfg, &channel, err, v["error_type"] == "configuration"));
                     } else {
-                        return Err(Failure::Down(format!("Zello took channel '{}' offline", cfg.channel)));
+                        return Err(Failure::Down(format!("Zello took channel '{channel}' offline")));
                     }
+                } else if let Some(channel) = v["seq"].as_u64().and_then(|n| texts_sent.remove(&n)) {
+                    let ok = v["success"] == true;
+                    let why = if ok { String::new() } else { format!("Zello wouldn't post it ({})", v["error"].as_str().unwrap_or("no reason given")) };
+                    report(Event::Posted { channel, ok, why });
                 } else if v["command"] == "on_error" {
                     report(Event::Note(format!("Zello says: {}", v["error"].as_str().unwrap_or("an error"))));
                 } else if let Sending::Starting { seq: want, busy, again_at, .. } = sending
@@ -461,6 +503,13 @@ fn converse(
         }
         let streaming = !matches!(sending, Sending::Idle);
         if online {
+            while let Some((_, channel, text)) = pipeline.texts.pop_front() {
+                let channel = channel.unwrap_or_else(|| cfg.channel.clone());
+                seq += 1;
+                let m = json!({ "command": "send_text_message", "seq": seq, "channel": channel, "text": text });
+                ws.send(Message::text(m.to_string())).map_err(lost)?;
+                texts_sent.insert(seq, channel);
+            }
             pipeline.expire(streaming, "it waited too long for the Zello channel", report);
             pump(cfg, ws, sending, &mut seq, pipeline, encoder, report)?;
         } else {
@@ -575,8 +624,17 @@ fn pump(
     Ok(())
 }
 
-fn same_channel(v: &Value, channel: &str) -> bool {
-    v["channel"].as_str().is_none_or(|c| c.eq_ignore_ascii_case(channel))
+/// The channels a connection joins: its own, then any for texts only.
+fn channels(cfg: &LinkConfig) -> Vec<String> {
+    std::iter::once(cfg.channel.clone()).chain(cfg.also.iter().cloned()).collect()
+}
+
+/// Which of this connection's channels an event is about (its own, when it doesn't say).
+fn our_channel(v: &Value, cfg: &LinkConfig) -> Option<String> {
+    match v["channel"].as_str() {
+        None => Some(cfg.channel.clone()),
+        Some(c) => channels(cfg).into_iter().find(|ours| ours.eq_ignore_ascii_case(c)),
+    }
 }
 
 fn refusal(cfg: &LinkConfig, code: &str) -> Failure {
@@ -592,8 +650,8 @@ fn refusal(cfg: &LinkConfig, code: &str) -> Failure {
     }
 }
 
-fn channel_refusal(cfg: &LinkConfig, err: &str, configuration: bool) -> Failure {
-    let mut why = format!("Zello won't connect {} to channel '{}': {err}", cfg.username, cfg.channel);
+fn channel_refusal(cfg: &LinkConfig, channel: &str, err: &str, configuration: bool) -> Failure {
+    let mut why = format!("Zello won't connect {} to channel '{channel}': {err}", cfg.username);
     if err.to_lowercase().contains("password") {
         why.push_str(". The Channel API can't join a channel that has a password: remove the channel's password in Zello");
     } else if configuration {
