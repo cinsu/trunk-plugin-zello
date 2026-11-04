@@ -8,7 +8,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
-use trunk_recorder_plugin::{AudioChunk, HostMessage, testing};
+use trunk_recorder_plugin::{AudioChunk, HostMessage, TonePattern, TonePatternEvent, testing};
 
 const PASSWORD: &str = "pw-very-secret";
 
@@ -62,10 +62,10 @@ fn refuses_incomplete_streams() {
 
 #[test]
 fn addresses_for_each_service() {
-    let p = plan(&config(work("")), &["sys1".into()]).unwrap();
+    let p = plan(&config(work("")), &["sys1".into()]).unwrap().streams;
     assert_eq!(p[0].link.url, "wss://zellowork.io/ws/testnet");
     assert!(p[0].link.tokens.is_none());
-    let p = plan(&config(consumer("")), &["sys1".into()]).unwrap();
+    let p = plan(&config(consumer("")), &["sys1".into()]).unwrap().streams;
     assert_eq!(p[0].link.url, "wss://zello.io/ws");
     assert!(p[0].link.tokens.is_some());
 }
@@ -81,7 +81,7 @@ fn network_names_as_people_paste_them() {
 fn streams_log_in_a_few_seconds_apart() {
     let mut v = work("");
     v["streams"] = json!([stream(Some(1)), stream(Some(2)), stream(Some(3))]);
-    let p = plan(&config(v), &["sys1".into()]).unwrap();
+    let p = plan(&config(v), &["sys1".into()]).unwrap().streams;
     let delays: Vec<u64> = p.iter().map(|s| s.link.start_delay.as_secs()).collect();
     assert_eq!(delays, [0, 3, 6]);
 }
@@ -171,6 +171,8 @@ impl FakeZello {
                                         json!({ "seq": v["seq"], "success": true, "stream_id": STREAM_ID })
                                     };
                                     let _ = ws.send(tungstenite::Message::text(reply.to_string()));
+                                } else if v["command"] == "send_text_message" {
+                                    let _ = ws.send(tungstenite::Message::text(json!({ "seq": v["seq"], "success": true }).to_string()));
                                 }
                             }
                             tungstenite::Message::Binary(b) => {
@@ -206,10 +208,11 @@ impl FakeZello {
 }
 
 fn welcome(logon: &Value) -> Vec<Value> {
-    vec![
-        json!({ "seq": 1, "success": true }),
-        json!({ "command": "on_channel_status", "channel": logon["channels"][0], "status": "online", "users_online": 3 }),
-    ]
+    let mut v = vec![json!({ "seq": 1, "success": true })];
+    for ch in logon["channels"].as_array().unwrap() {
+        v.push(json!({ "command": "on_channel_status", "channel": ch, "status": "online", "users_online": 3 }));
+    }
+    v
 }
 
 // ---- the plugin, run the way the recorder runs it ----
@@ -601,4 +604,101 @@ fn live_audio_is_never_sent_faster_than_real_time() {
         let allowed = (*t - t0).as_millis() as usize / 20 + 2;
         assert!(n < allowed, "packet {} arrived {:?} after the first: faster than real time", n + 1, *t - t0);
     }
+}
+
+// ---- page alerts ----
+
+fn with_alerts(server: &str, alerts: Value) -> Value {
+    let mut v = work(server);
+    v["alerts"] = alerts;
+    v["alertUsername"] = json!("gw-alerts");
+    v["alertPassword"] = json!(PASSWORD);
+    v
+}
+
+fn page(talkgroup: u32, signals: &[&str]) -> HostMessage {
+    let pattern = TonePattern {
+        pattern: "two_tone".into(),
+        tones: vec![849.6, 1292.9],
+        text: "two-tone 849.63 → 1292.85 Hz".into(),
+        signals: signals.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    HostMessage::TonePattern(TonePatternEvent { short_name: "sys1".into(), call_num: 40, talkgroup, pattern, ..Default::default() })
+}
+
+#[test]
+fn alert_settings_are_checked() {
+    let err = |alerts: Value, service: &str| {
+        let mut v = with_alerts("", alerts);
+        if service == "consumer" {
+            v["service"] = json!("consumer");
+            v["issuer"] = json!("test-issuer");
+            v["privateKey"] = json!(pem("PRIVATE KEY", TEST_PKCS8));
+        }
+        plan_err(v)
+    };
+    assert!(err(json!([{ "name": "Cathlamet" }]), "work").contains("tick the page"));
+    assert!(err(json!([{ "name": "Cathlamet", "signals": ["sys1:CATH"], "toStream": false }]), "work").contains("add a channel"));
+    let two = json!([{ "name": "A", "signals": ["sys1:A"], "channels": ["One", "Two"] }]);
+    assert!(err(two, "consumer").contains("one channel at a time"));
+    let mut v = with_alerts("", json!([{ "name": "A", "signals": ["sys1:A"], "channels": ["One"] }]));
+    v["alertPassword"] = json!("");
+    assert!(plan_err(v).contains("alert account"));
+    // To the stream's channel only: no alert account needed.
+    let mut v = work("");
+    v["alerts"] = json!([{ "name": "A", "signals": ["sys1:A"] }]);
+    let p = plan(&config(v), &["sys1".into()]).unwrap();
+    assert!(p.alert_link.is_none());
+    assert!(p.alerts[0].to_stream, "posting on the stream's channel is the default");
+}
+
+#[test]
+fn the_zello_alert_button() {
+    let m = serde_json::to_value(trunk_recorder_plugin::describe::<TrProZello>()).unwrap();
+    assert!(m["subscribe"].as_array().unwrap().contains(&json!("tone_pattern")));
+    let c = &m["contribute"][0];
+    assert_eq!(c["on"], "signal");
+    assert_eq!(c["append"], "alerts");
+    assert_eq!(c["item"], json!({ "name": "{name}", "signals": ["{signal}"], "toStream": true }));
+    let alert = &m["config"]["properties"]["alerts"]["items"];
+    assert_eq!(alert["properties"]["signals"]["x-signals"], true);
+    assert_eq!(m["config"]["properties"]["alertPassword"]["x-secret"], true);
+}
+
+#[test]
+fn a_page_posts_to_the_stream_and_other_channels() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let alerts = json!([{ "name": "Cathlamet Fire/EMS", "signals": ["sys1:CATH"], "channels": ["District 4", "Skamokawa"] }]);
+    let p = Running::start(with_alerts(&zello.url, alerts));
+    p.status_saying("Page alerts → 2 channels: connected", 15);
+    p.status_saying("Test → Test Channel: connected", 5);
+    p.send(page(101, &["CATH"]));
+    p.status_saying("Page alerts → 2 channels: connected, 6 online · 2 pages posted", 10);
+    let (said, _) = p.stop();
+    let texts = zello.commands("send_text_message");
+    let mut to: Vec<&str> = texts.iter().map(|t| t["channel"].as_str().unwrap()).collect();
+    to.sort();
+    assert_eq!(to, ["District 4", "Skamokawa", "Test Channel"]);
+    assert!(texts.iter().all(|t| t["text"] == "🔔 Page for Cathlamet Fire/EMS"));
+    // The alert account joined both channels in one login; the stream's account just its own.
+    let logons = zello.logons();
+    let alerts_logon = logons.iter().find(|l| l["username"] == "gw-alerts").unwrap();
+    assert_eq!(alerts_logon["channels"], json!(["District 4", "Skamokawa"]));
+    assert_no_secrets(&said);
+}
+
+#[test]
+fn other_pages_post_nothing() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let mut v = work(&zello.url);
+    v["alerts"] = json!([{ "name": "Cathlamet Fire/EMS", "signals": ["sys1:CATH"] }]);
+    let p = Running::start(v);
+    p.status_saying("connected", 10);
+    p.send(page(101, &["SKAM"])); // another page
+    p.send(page(101, &[])); // a page the recorder doesn't know
+    p.send(page(102, &["CATH"])); // on a talkgroup no stream carries: no stream channel to post to
+    std::thread::sleep(Duration::from_millis(500));
+    p.stop();
+    assert!(zello.commands("send_text_message").is_empty());
 }
