@@ -8,7 +8,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
-use trunk_recorder_plugin::{HostMessage, testing};
+use trunk_recorder_plugin::{AudioChunk, HostMessage, testing};
 
 const PASSWORD: &str = "pw-very-secret";
 
@@ -107,25 +107,47 @@ fn the_settings_form() {
 /// to hang up afterwards.
 type Behaviour = fn(&Value) -> (Vec<Value>, bool);
 
+/// How the stand-in answers requests to talk.
+#[derive(Clone, Copy, Default)]
+struct Talk {
+    /// Answer "channel busy" this many times first.
+    busy: usize,
+    /// Hang up after this many audio packets.
+    hang_up_after: Option<usize>,
+}
+
+const STREAM_ID: u64 = 4242;
+
+#[derive(Default)]
+struct Heard {
+    logons: Vec<Value>,
+    commands: Vec<Value>,
+    packets: Vec<(Instant, Vec<u8>)>,
+}
+
 struct FakeZello {
     url: String,
-    logons: Arc<Mutex<Vec<Value>>>,
+    heard: Arc<Mutex<Heard>>,
 }
 
 impl FakeZello {
     fn start(behaviour: Behaviour) -> FakeZello {
+        FakeZello::talking(behaviour, Talk::default())
+    }
+
+    fn talking(behaviour: Behaviour, talk: Talk) -> FakeZello {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-        let logons = Arc::new(Mutex::new(Vec::new()));
-        let seen = logons.clone();
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let log = heard.clone();
         std::thread::spawn(move || {
             for sock in listener.incoming().flatten() {
-                let seen = seen.clone();
+                let log = log.clone();
                 std::thread::spawn(move || {
                     let Ok(mut ws) = tungstenite::accept(sock) else { return };
                     let Ok(tungstenite::Message::Text(t)) = ws.read() else { return };
                     let logon: Value = serde_json::from_str(&t).unwrap();
-                    seen.lock().unwrap().push(logon.clone());
+                    log.lock().unwrap().logons.push(logon.clone());
                     let (replies, hang_up) = behaviour(&logon);
                     for r in replies {
                         let _ = ws.send(tungstenite::Message::text(r.to_string()));
@@ -135,15 +157,51 @@ impl FakeZello {
                         let _ = ws.flush();
                         return;
                     }
-                    while ws.read().is_ok() {}
+                    let mut busy = talk.busy;
+                    while let Ok(m) = ws.read() {
+                        match m {
+                            tungstenite::Message::Text(t) => {
+                                let v: Value = serde_json::from_str(&t).unwrap();
+                                log.lock().unwrap().commands.push(v.clone());
+                                if v["command"] == "start_stream" {
+                                    let reply = if busy > 0 {
+                                        busy -= 1;
+                                        json!({ "seq": v["seq"], "error": "channel busy" })
+                                    } else {
+                                        json!({ "seq": v["seq"], "success": true, "stream_id": STREAM_ID })
+                                    };
+                                    let _ = ws.send(tungstenite::Message::text(reply.to_string()));
+                                }
+                            }
+                            tungstenite::Message::Binary(b) => {
+                                let n = {
+                                    let mut h = log.lock().unwrap();
+                                    h.packets.push((Instant::now(), b.to_vec()));
+                                    h.packets.len()
+                                };
+                                if talk.hang_up_after == Some(n) {
+                                    return; // drops the connection
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 });
             }
         });
-        FakeZello { url, logons }
+        FakeZello { url, heard }
     }
 
     fn logons(&self) -> Vec<Value> {
-        self.logons.lock().unwrap().clone()
+        self.heard.lock().unwrap().logons.clone()
+    }
+
+    fn commands(&self, which: &str) -> Vec<Value> {
+        self.heard.lock().unwrap().commands.iter().filter(|c| c["command"] == which).cloned().collect()
+    }
+
+    fn packets(&self) -> Vec<(Instant, Vec<u8>)> {
+        self.heard.lock().unwrap().packets.clone()
     }
 }
 
@@ -249,6 +307,48 @@ fn call(talkgroup: u32, encrypted: bool) -> HostMessage {
     HostMessage::CallStart(CallInfo { short_name: "sys1".into(), talkgroup, encrypted, ..Default::default() })
 }
 
+fn call_numbered(id: u32, talkgroup: u32) -> CallInfo {
+    CallInfo { id, short_name: "sys1".into(), talkgroup, recording: true, ..Default::default() }
+}
+
+/// `seconds` of a 1 kHz tone at 8 kHz, as the recorder sends live audio (20 ms chunks).
+fn audio(id: u32, talkgroup: u32, seconds: f64) -> Vec<HostMessage> {
+    let n = (8000.0 * seconds) as usize;
+    let tone: Vec<i16> = (0..n).map(|i| (8000.0 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 8000.0).sin()) as i16).collect();
+    tone.chunks(160)
+        .map(|c| {
+            let mut a = AudioChunk::new(id, 0, talkgroup, 8000, c);
+            a.short_name = "sys1".into();
+            HostMessage::Audio(a)
+        })
+        .collect()
+}
+
+fn concluded(id: u32, talkgroup: u32) -> HostMessage {
+    let mut c = trunk_recorder_plugin::ConcludedCall { path: format!("sys1/2026/11/4/{talkgroup}-{id}"), ..Default::default() };
+    c.call.call_num = u64::from(id);
+    c.call.short_name = "sys1".into();
+    c.call.talkgroup = talkgroup;
+    HostMessage::CallConcluded(c)
+}
+
+/// A whole transmission, as the recorder tells it: start, audio, end, recording.
+fn transmission(p: &Running, id: u32, talkgroup: u32, seconds: f64) {
+    p.send(HostMessage::CallStart(call_numbered(id, talkgroup)));
+    for m in audio(id, talkgroup, seconds) {
+        p.send(m);
+    }
+    p.send(HostMessage::CallEnd(call_numbered(id, talkgroup)));
+    p.send(concluded(id, talkgroup));
+}
+
+fn results(said: &[Value]) -> Vec<(String, String)> {
+    said.iter()
+        .filter(|m| m["type"] == "call.result")
+        .map(|m| (m["path"].as_str().unwrap_or_default().to_string(), m["outcome"].as_str().unwrap_or_default().to_string()))
+        .collect()
+}
+
 #[test]
 fn zello_work_connects_and_counts_transmissions() {
     let zello = FakeZello::start(|l| (welcome(l), false));
@@ -348,5 +448,157 @@ fn assert_no_secrets(said: &[Value]) {
         let s = m.to_string();
         assert!(!s.contains(PASSWORD), "password in {s}");
         assert!(!s.contains(&key_part), "private key in {s}");
+    }
+}
+
+// ---- sending audio ----
+
+#[test]
+fn sends_a_transmission_to_zello_in_real_time() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk::default());
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    transmission(&p, 7, 101, 1.0);
+    p.status_saying("1 sent", 10);
+    let (said, _) = p.stop();
+
+    let start = &zello.commands("start_stream")[0];
+    assert_eq!(start["channel"], "Test Channel");
+    assert_eq!(start["codec"], "opus");
+    assert_eq!(start["codec_header"], "gLsBFA==");
+    assert_eq!(start["packet_duration"], 20);
+    let stop = zello.commands("stop_stream");
+    assert_eq!(stop.len(), 1);
+    assert_eq!(stop[0]["stream_id"], STREAM_ID);
+
+    let packets = zello.packets();
+    // 1 s is 50 packets of 20 ms, plus the filter's short tail.
+    assert!((50..=52).contains(&packets.len()), "{} packets", packets.len());
+    for (_, b) in &packets {
+        assert_eq!(b[0], 1, "audio packet");
+        assert_eq!(u32::from_be_bytes([b[1], b[2], b[3], b[4]]), STREAM_ID as u32);
+        assert_eq!(&b[5..9], &[0, 0, 0, 0], "packet id");
+    }
+    // The recorder sent it all at once; Zello got it no faster than real time.
+    let spread = packets.last().unwrap().0 - packets[0].0;
+    assert!(spread >= Duration::from_millis(900), "sent in {spread:?}");
+
+    // It's still a 1 kHz tone once Zello's apps decode it.
+    let mut err = 0;
+    let dec = unsafe { unsafe_libopus::opus_decoder_create(48000, 1, &mut err) };
+    let mut pcm = Vec::new();
+    for (_, b) in &packets {
+        let mut out = vec![0i16; 960];
+        let n = unsafe { unsafe_libopus::opus_decode(dec, b[9..].as_ptr(), (b.len() - 9) as i32, out.as_mut_ptr(), 960, 0) };
+        assert_eq!(n, 960);
+        pcm.extend_from_slice(&out);
+    }
+    unsafe { unsafe_libopus::opus_decoder_destroy(dec) };
+    let mid = &pcm[48000 / 4..48000 * 3 / 4];
+    let (mut re, mut im) = (0.0f64, 0.0f64);
+    for (i, &s) in mid.iter().enumerate() {
+        let a = 2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48000.0;
+        re += f64::from(s) * a.cos();
+        im += f64::from(s) * a.sin();
+    }
+    let level = 2.0 * (re * re + im * im).sqrt() / mid.len() as f64;
+    assert!((level - 8000.0).abs() < 2000.0, "1 kHz came through at {level:.0}");
+
+    assert_eq!(results(&said), vec![("sys1/2026/11/4/101-7".to_string(), "ok".to_string())]);
+    assert!(said.iter().any(|m| m["type"] == "metrics" && m["extra"]["transmissions sent"] == 1));
+}
+
+#[test]
+fn waits_out_a_busy_channel() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { busy: 2, ..Default::default() });
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    transmission(&p, 8, 101, 0.3);
+    p.status_saying("1 sent", 10);
+    let (said, _) = p.stop();
+    assert_eq!(zello.commands("start_stream").len(), 3, "asked again after each busy");
+    assert_eq!(results(&said)[0].1, "ok");
+}
+
+#[test]
+fn gives_up_on_a_channel_that_stays_busy() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { busy: 100, ..Default::default() });
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    transmission(&p, 9, 101, 0.3);
+    let (state, text) = p.status_saying("1 failed", 15);
+    assert_eq!(state, "ok", "the connection itself is fine: {text}");
+    let (said, _) = p.stop();
+    assert!(zello.packets().is_empty());
+    assert_eq!(results(&said)[0].1, "failed");
+    assert!(said.iter().any(|m| m["message"].as_str().is_some_and(|t| t.contains("stayed busy"))));
+}
+
+#[test]
+fn only_its_own_talkgroup_and_nothing_encrypted() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk::default());
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    transmission(&p, 10, 102, 0.3); // another talkgroup
+    let mut enc = call_numbered(11, 101);
+    enc.encrypted = true;
+    p.send(HostMessage::CallStart(enc));
+    std::thread::sleep(Duration::from_millis(600));
+    let (said, _) = p.stop();
+    assert!(zello.commands("start_stream").is_empty());
+    assert!(results(&said).is_empty());
+}
+
+#[test]
+fn a_dropped_connection_fails_the_transmission_and_reconnects() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { hang_up_after: Some(10), ..Default::default() });
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    transmission(&p, 12, 101, 1.0);
+    p.status_saying("1 failed", 10);
+    let end = Instant::now() + Duration::from_secs(10);
+    while zello.logons().len() < 2 {
+        assert!(Instant::now() < end, "it never logged in again");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (said, _) = p.stop();
+    assert_eq!(results(&said), vec![("sys1/2026/11/4/101-12".to_string(), "failed".to_string())]);
+}
+
+#[test]
+fn two_transmissions_go_one_after_the_other() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk::default());
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    transmission(&p, 20, 101, 0.4);
+    transmission(&p, 21, 101, 0.4);
+    p.status_saying("2 sent", 10);
+    let (said, _) = p.stop();
+    assert_eq!(zello.commands("start_stream").len(), 2);
+    assert_eq!(zello.commands("stop_stream").len(), 2);
+    assert_eq!(results(&said).len(), 2);
+}
+
+#[test]
+fn live_audio_is_never_sent_faster_than_real_time() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk::default());
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    p.send(HostMessage::CallStart(call_numbered(30, 101)));
+    // As the recorder does on the air: 20 ms of audio every 20 ms, with a pause in the middle.
+    for (i, m) in audio(30, 101, 1.0).into_iter().enumerate() {
+        p.send(m);
+        std::thread::sleep(Duration::from_millis(if i == 25 { 300 } else { 20 }));
+    }
+    p.send(HostMessage::CallEnd(call_numbered(30, 101)));
+    p.status_saying("1 sent", 10);
+    p.stop();
+    let packets = zello.packets();
+    assert!(packets.len() >= 50);
+    // However the audio arrived, by any moment Zello never has more than real time's worth.
+    let t0 = packets[0].0;
+    for (n, (t, _)) in packets.iter().enumerate() {
+        let allowed = (*t - t0).as_millis() as usize / 20 + 2;
+        assert!(n < allowed, "packet {} arrived {:?} after the first: faster than real time", n + 1, *t - t0);
     }
 }

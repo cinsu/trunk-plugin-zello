@@ -5,8 +5,15 @@ radio audio to Zello channels, on consumer Zello or Zello Work.
 
 A community plugin: not made by, endorsed by or affiliated with Zello.
 
-**Work in progress.** It logs each stream's Zello account on to its channel, keeps it connected and
-shows how each is doing, and counts the transmissions it will send. It doesn't send audio yet.
+**Work in progress**, not released yet.
+
+Each stream logs a Zello account on to a channel and sends a system's talkgroup (or all of the
+system) to it live: each transmission as it's heard, one at a time, as 48 kHz Opus. When the
+channel is busy it waits and asks again; a transmission that can't go out within 10 seconds is
+dropped rather than sent late. The plugin's card shows each stream's connection and what it sent
+or failed to send, and each recorded call shows whether it went to Zello.
+
+Encrypted calls are never sent.
 
 ## What it needs
 
@@ -31,7 +38,11 @@ The private key and passwords are kept in the recorder's settings and never writ
 ## What it sends where
 
 To Zello only (zello.io, or zellowork.io for Zello Work): each stream's login, with a short-lived
-token signed with your Private Key for consumer Zello. Nothing else, and nowhere else.
+token signed with your Private Key for consumer Zello, and the audio of the transmissions on that
+stream's talkgroup. Nothing else, and nowhere else.
+
+Mind what you rebroadcast: a consumer Zello channel can be public, and some agencies don't allow
+their traffic to be streamed.
 
 ## Building
 
