@@ -86,7 +86,7 @@ struct Config {
 }
 
 /// Stream
-#[derive(Serialize, Deserialize, JsonSchema, Default, Clone)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase", default)]
 struct StreamConfig {
     /// Name
@@ -110,12 +110,34 @@ struct StreamConfig {
     /// Zello password
     #[schemars(extend("x-secret" = true))]
     password: String,
+    /// Max wait, seconds
+    ///
+    /// Zello carries one transmission at a time. One that has to wait longer
+    /// than this for its turn (behind another, or for Zello to connect) is
+    /// dropped rather than sent late. Longer suits a stream of several
+    /// talkgroups; shorter keeps a live channel live.
+    #[schemars(range(min = 1, max = 300))]
+    max_wait_s: u32,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        StreamConfig {
+            name: String::new(),
+            system: String::new(),
+            talkgroup: None,
+            channel: String::new(),
+            username: String::new(),
+            password: String::new(),
+            max_wait_s: 10,
+        }
+    }
 }
 
 /// Page alert
 #[derive(Serialize, Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase", default)]
-#[schemars(extend("x-title" = "name"))]
+#[schemars(extend("x-title" = "name", "x-actions" = [{ "id": "test", "label": "Send a test", "hint": "Posts a test alert where this one would go (save the settings first)" }]))]
 struct AlertConfig {
     /// Name
     ///
@@ -208,6 +230,7 @@ fn plan(c: &Config, systems: &[String]) -> Result<Plan, String> {
                 network: network.clone(),
                 // Zello limits logins that come all at once.
                 start_delay: Duration::from_secs(3 * i as u64),
+                max_wait: Duration::from_secs(u64::from(s.max_wait_s.clamp(1, 300))),
             },
         });
     }
@@ -252,6 +275,7 @@ fn plan(c: &Config, systems: &[String]) -> Result<Plan, String> {
             tokens,
             network,
             start_delay: Duration::from_secs(3 * c.streams.len() as u64),
+            max_wait: Duration::from_secs(10),
         })
     };
     Ok(Plan { streams: planned, alerts, alert_link })
@@ -418,11 +442,34 @@ impl TrProZello {
         self.routes.iter().filter(|r| r.system == short_name && r.talkgroup.is_none_or(|t| t == talkgroup)).map(|r| r.stream).collect()
     }
 
+    /// A stream's (or the alert account's) channel.
+    fn links_channel(&self, i: usize) -> String {
+        self.board.lock().unwrap().streams[i].channel.clone()
+    }
+
+    /// The channels the alert account joined.
+    fn alert_channels(&self) -> Vec<String> {
+        self.alerts.iter().flat_map(|a| a.channels.iter().cloned()).collect()
+    }
+
+    /// Posts a text to streams' channels and other channels; how many it sent.
+    fn post(&self, text: &str, streams: &[usize], channels: &[String], ack: Option<&zello::Ack>) -> usize {
+        for &s in streams {
+            self.links[s].send(Cmd::Text { channel: None, text: text.to_string(), ack: ack.cloned() });
+        }
+        if let Some(l) = self.alert_link {
+            for ch in channels {
+                self.links[l].send(Cmd::Text { channel: Some(ch.clone()), text: text.to_string(), ack: ack.cloned() });
+            }
+        }
+        streams.len() + if self.alert_link.is_some() { channels.len() } else { 0 }
+    }
+
     /// A call starts on these streams.
-    fn begin(&mut self, call: u32, streams: Vec<usize>) {
+    fn begin(&mut self, call: u32, talkgroup: u32, streams: Vec<usize>) {
         let mut b = self.board.lock().unwrap();
         for &s in &streams {
-            self.links[s].send(Cmd::Start { call });
+            self.links[s].send(Cmd::Start { call, talkgroup });
             b.pending.insert((s, call), Pending { since: Some(Instant::now()), ..Default::default() });
         }
         self.calls.insert(call, streams);
@@ -518,20 +565,75 @@ impl Plugin for TrProZello {
             return;
         }
         let streams = self.streams_for(&t.short_name, t.talkgroup);
-        for a in self.alerts.iter().filter(|a| a.signals.iter().any(|s| heard.contains(s))) {
-            let text = format!("🔔 Page for {}", a.name);
-            self.host.info(format!("Page heard: {} (talkgroup {})", a.name, t.talkgroup));
-            if a.to_stream {
-                for &s in &streams {
-                    self.links[s].send(Cmd::Text { channel: None, text: text.clone() });
-                }
-            }
-            if let Some(l) = self.alert_link {
-                for ch in &a.channels {
-                    self.links[l].send(Cmd::Text { channel: Some(ch.clone()), text: text.clone() });
-                }
-            }
+        let matched: Vec<usize> = (0..self.alerts.len()).filter(|&i| self.alerts[i].signals.iter().any(|s| heard.contains(s))).collect();
+        if matched.is_empty() {
+            return;
         }
+        for i in matched {
+            let a = &self.alerts[i];
+            let text = format!("🔔 Page for {}", a.name);
+            let (to_streams, to_channels) = (if a.to_stream { streams.clone() } else { Vec::new() }, a.channels.clone());
+            let mut where_to: Vec<String> = to_streams.iter().map(|&s| format!("'{}'", self.links_channel(s))).collect();
+            where_to.extend(to_channels.iter().map(|c| format!("'{c}'")));
+            if where_to.is_empty() {
+                self.host.warn(format!(
+                    "Page heard: {} on {} talkgroup {}, but there's nowhere to post it: no stream carries that talkgroup",
+                    a.name, t.short_name, t.talkgroup
+                ));
+                continue;
+            }
+            self.host.info(format!("Page heard: {} on {} talkgroup {} → {}", a.name, t.short_name, t.talkgroup, where_to.join(", ")));
+            self.post(&text, &to_streams, &to_channels, None);
+        }
+    }
+
+    fn action(&mut self, a: trunk_recorder_plugin::Action, reply: trunk_recorder_plugin::Reply) {
+        if a.action != "test" {
+            return reply.fail("This plugin has no such action");
+        }
+        let alert: AlertConfig = match serde_json::from_value(a.value) {
+            Ok(x) => x,
+            Err(e) => return reply.fail(format!("That alert couldn't be read ({e})")),
+        };
+        let systems: Vec<&str> = alert.signals.iter().filter_map(|s| s.split_once(':').map(|x| x.0)).collect();
+        if alert.to_stream && systems.is_empty() {
+            return reply.fail("Tick the page (signal) it's for first: the test goes to the streams of that page's system.");
+        }
+        let to_streams: Vec<usize> =
+            if alert.to_stream { self.routes.iter().filter(|r| systems.contains(&r.system.as_str())).map(|r| r.stream).collect() } else { Vec::new() };
+        let to_channels: Vec<String> = alert.channels.iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+        if let Some(missing) = to_channels.iter().find(|c| !self.alert_channels().iter().any(|x| x.eq_ignore_ascii_case(c))) {
+            return reply.fail(format!("'{missing}' isn't in the saved settings yet: save them, then test."));
+        }
+        if to_streams.is_empty() && to_channels.is_empty() {
+            return reply.fail("Nowhere to post it: no stream is on that page's system, and no other channels are listed.");
+        }
+        let name = if alert.name.trim().is_empty() { "this alert".to_string() } else { alert.name.trim().to_string() };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let n = self.post(&format!("🔔 Test: Page for {name}"), &to_streams, &to_channels, Some(&tx));
+        drop(tx);
+        // Zello answers each in a few seconds at most; the reply waits for all of them.
+        std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(25);
+            let (mut posted, mut failed) = (Vec::new(), Vec::new());
+            while posted.len() + failed.len() < n {
+                match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+                    Ok(Ok(channel)) => posted.push(format!("'{channel}'")),
+                    Ok(Err(why)) => failed.push(why),
+                    Err(_) => {
+                        failed.push("no answer from the plugin's Zello connection".into());
+                        break;
+                    }
+                }
+            }
+            if failed.is_empty() {
+                reply.ok(format!("Posted to {}", posted.join(", ")));
+            } else if posted.is_empty() {
+                reply.fail(format!("Not posted: {}", failed.join("; ")));
+            } else {
+                reply.fail(format!("Posted to {}, but not everywhere: {}", posted.join(", "), failed.join("; ")));
+            }
+        });
     }
 
     fn call_start(&mut self, call: CallInfo) {
@@ -549,7 +651,7 @@ impl Plugin for TrProZello {
             }
             b.publish(&self.host);
         }
-        self.begin(call.id, streams);
+        self.begin(call.id, call.talkgroup, streams);
     }
 
     fn audio(&mut self, chunk: AudioChunk) {
@@ -563,7 +665,7 @@ impl Plugin for TrProZello {
             if streams.is_empty() {
                 return;
             }
-            self.begin(chunk.call_id, streams);
+            self.begin(chunk.call_id, chunk.talkgroup, streams);
         }
         let samples = chunk.samples();
         for &s in &self.calls[&chunk.call_id] {
@@ -623,9 +725,11 @@ fn reporter(i: usize, host: &Host, board: &Arc<Mutex<Board>>) -> zello::Report {
             }
             Event::Load { queued, streaming } => (e.queued, e.streaming) = (queued, streaming),
             Event::Note(text) => h.warn(format!("{}: {text}", e.name)),
+            Event::Info(text) => h.info(format!("{}: {text}", e.name)),
             Event::Posted { channel, ok, why } => {
                 if ok {
                     e.posted += 1;
+                    h.info(format!("{}: page alert posted to '{channel}'", e.name));
                 } else {
                     h.warn(format!("{}: a page alert wasn't posted to '{channel}': {why}", e.name));
                 }

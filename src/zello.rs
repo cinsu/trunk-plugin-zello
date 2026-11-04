@@ -77,6 +77,8 @@ pub enum Event {
         ok: bool,
         why: String,
     },
+    /// Something worth a line in the log, that's going as it should.
+    Info(String),
     /// Something worth a line in the log.
     Note(String),
 }
@@ -86,6 +88,7 @@ pub enum Event {
 pub enum Cmd {
     Start {
         call: u32,
+        talkgroup: u32,
     },
     Audio {
         call: u32,
@@ -95,10 +98,12 @@ pub enum Cmd {
     End {
         call: u32,
     },
-    /// A text for a channel: `None` is the connection's own channel.
+    /// A text for a channel: `None` is the connection's own channel. `ack`,
+    /// when given, hears how it went: the channel, or why it wasn't posted.
     Text {
         channel: Option<String>,
         text: String,
+        ack: Option<Ack>,
     },
 }
 
@@ -119,9 +124,13 @@ pub struct LinkConfig {
     /// Wait this long before the first connection, so several streams don't
     /// all log in at once (Zello limits that).
     pub start_delay: Duration,
+    /// A transmission waits this long at most for its turn (behind others on
+    /// the channel, or for Zello to come back); then it's dropped, not sent late.
+    pub max_wait: Duration,
 }
 
 pub type Report = Arc<dyn Fn(Event) + Send + Sync>;
+pub type Ack = Sender<Result<String, String>>;
 
 /// A running connection.
 pub struct Link {
@@ -135,7 +144,10 @@ impl Link {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let (tx, rx) = mpsc::channel();
-        let thread = thread::spawn(move || run(cfg, Pipeline::new(rx), &flag, &report));
+        let thread = thread::spawn(move || {
+            let pipeline = Pipeline::new(rx, cfg.max_wait);
+            run(cfg, pipeline, &flag, &report)
+        });
         Link { stop, tx, thread: Some(thread) }
     }
 
@@ -160,9 +172,8 @@ enum Failure {
 
 // ---- transmissions waiting to go ----
 
-/// A transmission waits this long at most for its turn (behind others on a
-/// busy channel, or for Zello to come back); then it's dropped, not sent late.
-const MAX_WAIT: Duration = Duration::from_secs(10);
+/// A text waits this long at most for Zello to be connected, and then for its answer.
+const TEXT_WAIT: Duration = Duration::from_secs(10);
 /// Once a stream has fallen this far behind the radio, the oldest audio is dropped.
 const MAX_BEHIND: usize = 3 * audio::RATE as usize;
 /// A call that has had no audio for this long is taken to have ended (its end was lost).
@@ -170,6 +181,7 @@ const SILENT_END: Duration = Duration::from_secs(3);
 
 struct Tx {
     call: u32,
+    talkgroup: u32,
     created: Instant,
     last_audio: Instant,
     ended: bool,
@@ -180,9 +192,9 @@ struct Tx {
 }
 
 impl Tx {
-    fn new(call: u32) -> Tx {
+    fn new(call: u32, talkgroup: u32) -> Tx {
         let now = Instant::now();
-        Tx { call, created: now, last_audio: now, ended: false, rate: 0, up: None, pcm: VecDeque::new() }
+        Tx { call, talkgroup, created: now, last_audio: now, ended: false, rate: 0, up: None, pcm: VecDeque::new() }
     }
 
     fn end(&mut self) {
@@ -195,33 +207,62 @@ impl Tx {
     }
 }
 
+/// A text waiting to go, or waiting for Zello's answer.
+struct Text {
+    at: Instant,
+    /// `None`: the connection's own channel.
+    channel: Option<String>,
+    text: String,
+    ack: Option<Ack>,
+}
+
+impl Text {
+    /// It went (`Ok`), or didn't (why): reports it, and answers whoever asked.
+    fn done(self, result: Result<String, String>, own: Option<&str>, report: &Report) {
+        let channel = self.channel.clone().or_else(|| own.map(str::to_string)).unwrap_or_default();
+        match &result {
+            Ok(_) => report(Event::Posted { channel: channel.clone(), ok: true, why: String::new() }),
+            Err(why) => report(Event::Posted { channel: channel.clone(), ok: false, why: why.clone() }),
+        }
+        if let Some(ack) = self.ack {
+            let _ = ack.send(result.map(|_| channel));
+        }
+    }
+}
+
+/// "talkgroup 101", or "a call" when it isn't known.
+fn talkgroup_name(tg: u32) -> String {
+    if tg == 0 { "a call".to_string() } else { format!("talkgroup {tg}") }
+}
+
 struct Pipeline {
     rx: Receiver<Cmd>,
     queue: VecDeque<Tx>,
-    /// Texts waiting to go: when they came, the channel (`None`: the connection's own), the text.
-    texts: VecDeque<(Instant, Option<String>, String)>,
+    /// Texts waiting to go.
+    texts: VecDeque<Text>,
+    max_wait: Duration,
     load: (usize, bool),
     dropped: usize,
     noted_rate: bool,
 }
 
 impl Pipeline {
-    fn new(rx: Receiver<Cmd>) -> Pipeline {
-        Pipeline { rx, queue: VecDeque::new(), texts: VecDeque::new(), load: (0, false), dropped: 0, noted_rate: false }
+    fn new(rx: Receiver<Cmd>, max_wait: Duration) -> Pipeline {
+        Pipeline { rx, queue: VecDeque::new(), texts: VecDeque::new(), max_wait, load: (0, false), dropped: 0, noted_rate: false }
     }
 
     /// Takes what the plugin sent.
     fn take(&mut self, report: &Report) {
         while let Ok(cmd) = self.rx.try_recv() {
             match cmd {
-                Cmd::Start { call } => {
+                Cmd::Start { call, talkgroup } => {
                     if !self.queue.iter().any(|t| t.call == call) {
-                        self.queue.push_back(Tx::new(call));
+                        self.queue.push_back(Tx::new(call, talkgroup));
                     }
                 }
                 Cmd::Audio { call, rate, samples } => {
                     if !self.queue.iter().any(|t| t.call == call) {
-                        self.queue.push_back(Tx::new(call)); // its start was missed
+                        self.queue.push_back(Tx::new(call, 0)); // its start was missed
                     }
                     let tx = self.queue.iter_mut().find(|t| t.call == call).expect("just added");
                     if tx.ended {
@@ -245,21 +286,30 @@ impl Pipeline {
                         tx.end();
                     }
                 }
-                Cmd::Text { channel, text } => self.texts.push_back((Instant::now(), channel, text)),
+                Cmd::Text { channel, text, ack } => self.texts.push_back(Text { at: Instant::now(), channel, text, ack }),
             }
         }
     }
 
     /// Drops transmissions that waited too long for their turn, all but the
-    /// first (`front_busy`: it's being sent), and ends silent ones.
-    fn expire(&mut self, front_busy: bool, why: &str, report: &Report) {
+    /// first when it's being sent (`front_busy`), and ends silent ones.
+    /// `connected`: Zello is, so they waited behind another transmission.
+    fn expire(&mut self, front_busy: bool, connected: bool, report: &Report) {
         let skip = usize::from(front_busy);
         let mut i = skip;
         while i < self.queue.len() {
-            if self.queue[i].created.elapsed() > MAX_WAIT {
+            if self.queue[i].created.elapsed() > self.max_wait {
                 let tx = self.queue.remove(i).expect("in range");
                 let waited = tx.created.elapsed();
-                report(Event::Done { call: tx.call, outcome: Outcome::Failed, why: why.into(), took: Duration::ZERO, waited });
+                let behind = match self.queue.front() {
+                    Some(f) if front_busy && connected => {
+                        format!("behind {} (on the channel for {} s)", talkgroup_name(f.talkgroup), f.created.elapsed().as_secs())
+                    }
+                    _ if connected => "for the Zello channel".to_string(),
+                    _ => "for Zello to connect".to_string(),
+                };
+                let why = format!("{} waited over {} s {behind}", talkgroup_name(tx.talkgroup), self.max_wait.as_secs());
+                report(Event::Done { call: tx.call, outcome: Outcome::Failed, why, took: Duration::ZERO, waited });
             } else {
                 i += 1;
             }
@@ -269,10 +319,9 @@ impl Pipeline {
                 tx.end();
             }
         }
-        while self.texts.front().is_some_and(|t| t.0.elapsed() > MAX_WAIT) {
-            let (_, channel, _) = self.texts.pop_front().expect("checked");
-            let channel = channel.unwrap_or_default();
-            report(Event::Posted { channel, ok: false, why: "Zello wasn't connected".into() });
+        while self.texts.front().is_some_and(|t| t.at.elapsed() > TEXT_WAIT) {
+            let t = self.texts.pop_front().expect("checked");
+            t.done(Err("Zello wasn't connected".into()), None, report);
         }
     }
 
@@ -332,7 +381,7 @@ fn pause(stop: &AtomicBool, d: Duration, pipeline: &mut Pipeline, report: &Repor
             return false;
         }
         pipeline.take(report);
-        pipeline.expire(false, "Zello wasn't connected", report);
+        pipeline.expire(false, false, report);
         pipeline.report_load(false, report);
         thread::sleep(Duration::from_millis(50).min(end - Instant::now()));
     }
@@ -379,7 +428,11 @@ fn session(
     report(Event::State(LinkState::Connecting));
     let mut ws = open(cfg)?;
     let mut sending = Sending::Idle;
-    let result = converse(cfg, stop, report, online_since, pipeline, encoder, &mut ws, &mut sending);
+    let mut texts_sent = HashMap::new();
+    let result = converse(cfg, stop, report, online_since, pipeline, encoder, &mut ws, &mut sending, &mut texts_sent);
+    for (_, t) in texts_sent.drain() {
+        t.done(Err("the connection to Zello was lost before it answered".into()), Some(&cfg.channel), report);
+    }
     if !matches!(sending, Sending::Idle) {
         // Cut off mid-transmission: that one is lost.
         if let Some(tx) = pipeline.queue.pop_front() {
@@ -404,6 +457,7 @@ fn converse(
     encoder: &mut Encoder,
     ws: &mut WebSocket<Conn>,
     sending: &mut Sending,
+    texts_sent: &mut HashMap<u64, Text>,
 ) -> Result<(), Failure> {
     let mut logon = json!({
         "command": "logon",
@@ -427,7 +481,7 @@ fn converse(
     let mut seq: u64 = 1;
     // Channels online, with their users; texts sent, by seq, to their channel.
     let mut joined: HashMap<String, u64> = HashMap::new();
-    let mut texts_sent: HashMap<u64, String> = HashMap::new();
+    let mut noted_no_texts = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = ws.close(None);
@@ -449,6 +503,10 @@ fn converse(
                     && let Some(channel) = our_channel(&v, cfg)
                 {
                     if v["status"] == "online" {
+                        if v["texting_supported"] == false && !noted_no_texts {
+                            noted_no_texts = true;
+                            report(Event::Note(format!("channel '{channel}' doesn't accept texts, so page alerts can't be posted there")));
+                        }
                         joined.insert(channel, v["users_online"].as_u64().unwrap_or(0));
                         if joined.len() == channels(cfg).len() {
                             online = true;
@@ -460,10 +518,13 @@ fn converse(
                     } else {
                         return Err(Failure::Down(format!("Zello took channel '{channel}' offline")));
                     }
-                } else if let Some(channel) = v["seq"].as_u64().and_then(|n| texts_sent.remove(&n)) {
-                    let ok = v["success"] == true;
-                    let why = if ok { String::new() } else { format!("Zello wouldn't post it ({})", v["error"].as_str().unwrap_or("no reason given")) };
-                    report(Event::Posted { channel, ok, why });
+                } else if let Some(t) = v["seq"].as_u64().and_then(|n| texts_sent.remove(&n)) {
+                    let result = if v["success"] == true {
+                        Ok(String::new())
+                    } else {
+                        Err(format!("Zello wouldn't post it ({})", v["error"].as_str().unwrap_or("no reason given")))
+                    };
+                    t.done(result, Some(&cfg.channel), report);
                 } else if v["command"] == "on_error" {
                     report(Event::Note(format!("Zello says: {}", v["error"].as_str().unwrap_or("an error"))));
                 } else if let Sending::Starting { seq: want, busy, again_at, .. } = sending
@@ -485,6 +546,9 @@ fn converse(
                             *sending = Sending::Idle;
                         }
                     }
+                } else if let Some(err) = v["error"].as_str() {
+                    // An error this plugin didn't expect: worth seeing.
+                    report(Event::Note(format!("Zello says: {err} ({})", short(&text))));
                 }
                 // Other events (others talking, texts, …) aren't ours to act on.
             }
@@ -503,17 +567,24 @@ fn converse(
         }
         let streaming = !matches!(sending, Sending::Idle);
         if online {
-            while let Some((_, channel, text)) = pipeline.texts.pop_front() {
-                let channel = channel.unwrap_or_else(|| cfg.channel.clone());
+            while let Some(mut t) = pipeline.texts.pop_front() {
+                let channel = t.channel.clone().unwrap_or_else(|| cfg.channel.clone());
                 seq += 1;
-                let m = json!({ "command": "send_text_message", "seq": seq, "channel": channel, "text": text });
+                let m = json!({ "command": "send_text_message", "seq": seq, "channel": channel, "text": t.text });
                 ws.send(Message::text(m.to_string())).map_err(lost)?;
-                texts_sent.insert(seq, channel);
+                report(Event::Info(format!("posting \"{}\" to '{channel}'", t.text)));
+                t.at = Instant::now(); // now waiting for Zello's answer
+                texts_sent.insert(seq, t);
             }
-            pipeline.expire(streaming, "it waited too long for the Zello channel", report);
+            let late: Vec<u64> = texts_sent.iter().filter(|(_, t)| t.at.elapsed() > TEXT_WAIT).map(|(n, _)| *n).collect();
+            for n in late {
+                let t = texts_sent.remove(&n).expect("listed");
+                t.done(Err(format!("Zello didn't answer within {} s", TEXT_WAIT.as_secs())), Some(&cfg.channel), report);
+            }
+            pipeline.expire(streaming, true, report);
             pump(cfg, ws, sending, &mut seq, pipeline, encoder, report)?;
         } else {
-            pipeline.expire(false, "Zello wasn't connected", report);
+            pipeline.expire(false, false, report);
         }
         pipeline.report_load(!matches!(sending, Sending::Idle), report);
     }
@@ -622,6 +693,11 @@ fn pump(
         }
     }
     Ok(())
+}
+
+/// A message from Zello, shortened for the log.
+fn short(text: &str) -> String {
+    if text.chars().count() > 200 { format!("{}…", text.chars().take(200).collect::<String>()) } else { text.to_string() }
 }
 
 /// The channels a connection joins: its own, then any for texts only.

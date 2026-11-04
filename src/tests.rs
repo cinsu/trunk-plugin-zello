@@ -112,6 +112,8 @@ type Behaviour = fn(&Value) -> (Vec<Value>, bool);
 struct Talk {
     /// Answer "channel busy" this many times first.
     busy: usize,
+    /// Texts: never answer them (`Some(false)`), or refuse them (`Some(true)`).
+    texts: Option<bool>,
     /// Hang up after this many audio packets.
     hang_up_after: Option<usize>,
 }
@@ -172,7 +174,14 @@ impl FakeZello {
                                     };
                                     let _ = ws.send(tungstenite::Message::text(reply.to_string()));
                                 } else if v["command"] == "send_text_message" {
-                                    let _ = ws.send(tungstenite::Message::text(json!({ "seq": v["seq"], "success": true }).to_string()));
+                                    let reply = match talk.texts {
+                                        None => Some(json!({ "seq": v["seq"], "success": true })),
+                                        Some(false) => None,
+                                        Some(true) => Some(json!({ "seq": v["seq"], "error": "not allowed" })),
+                                    };
+                                    if let Some(r) = reply {
+                                        let _ = ws.send(tungstenite::Message::text(r.to_string()));
+                                    }
                                 }
                             }
                             tungstenite::Message::Binary(b) => {
@@ -701,4 +710,153 @@ fn other_pages_post_nothing() {
     std::thread::sleep(Duration::from_millis(500));
     p.stop();
     assert!(zello.commands("send_text_message").is_empty());
+}
+
+// ---- page alerts: what happened to each, and the test button ----
+
+/// Everything the plugin logged, as one text.
+fn logged(said: &[Value]) -> String {
+    said.iter().filter(|m| m["type"] == "log").map(|m| m["message"].as_str().unwrap_or_default()).collect::<Vec<_>>().join("\n")
+}
+
+fn wait_for<T>(secs: u64, what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let end = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(x) = f() {
+            return x;
+        }
+        assert!(Instant::now() < end, "never saw {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn action(request: u64, value: Value) -> HostMessage {
+    HostMessage::Action(trunk_recorder_plugin::Action { request, action: "test".into(), value })
+}
+
+fn action_result(p: &Running, request: u64, secs: u64) -> Value {
+    wait_for(secs, "the button's answer", || p.messages().into_iter().find(|m| m["type"] == "action.result" && m["request"] == request))
+}
+
+#[test]
+fn every_page_alert_is_logged() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let mut v = work(&zello.url);
+    v["alerts"] = json!([{ "name": "Cathlamet Fire/EMS", "signals": ["sys1:CATH"] }]);
+    let p = Running::start(v);
+    p.status_saying("connected", 10);
+    p.send(page(101, &["CATH"]));
+    p.status_saying("1 page posted", 10);
+    p.send(page(102, &["CATH"])); // no stream carries 102
+    std::thread::sleep(Duration::from_millis(300));
+    let (said, _) = p.stop();
+    let log = logged(&said);
+    assert!(log.contains("Page heard: Cathlamet Fire/EMS on sys1 talkgroup 101 → 'Test Channel'"), "{log}");
+    assert!(log.contains("posting \"🔔 Page for Cathlamet Fire/EMS\" to 'Test Channel'"), "{log}");
+    assert!(log.contains("page alert posted to 'Test Channel'"), "{log}");
+    assert!(log.contains("talkgroup 102, but there's nowhere to post it"), "{log}");
+}
+
+#[test]
+fn zello_not_answering_a_page_alert_is_logged() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { texts: Some(false), ..Default::default() });
+    let mut v = work(&zello.url);
+    v["alerts"] = json!([{ "name": "Cathlamet", "signals": ["sys1:CATH"] }]);
+    let p = Running::start(v);
+    p.status_saying("connected", 10);
+    p.send(page(101, &["CATH"]));
+    wait_for(15, "the no-answer warning", || logged(&p.messages()).contains("Zello didn't answer within 10 s").then_some(()));
+    p.stop();
+}
+
+#[test]
+fn zello_refusing_a_page_alert_is_logged() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { texts: Some(true), ..Default::default() });
+    let mut v = work(&zello.url);
+    v["alerts"] = json!([{ "name": "Cathlamet", "signals": ["sys1:CATH"] }]);
+    let p = Running::start(v);
+    p.status_saying("connected", 10);
+    p.send(page(101, &["CATH"]));
+    wait_for(10, "the refusal", || logged(&p.messages()).contains("wasn't posted to 'Test Channel': Zello wouldn't post it (not allowed)").then_some(()));
+    p.stop();
+}
+
+#[test]
+fn a_channel_without_texts_is_pointed_out() {
+    let zello = FakeZello::start(|l| {
+        let ch = &l["channels"][0];
+        let status = json!({ "command": "on_channel_status", "channel": ch, "status": "online", "users_online": 1, "texting_supported": false });
+        (vec![json!({ "seq": 1, "success": true }), status], false)
+    });
+    let p = Running::start(work(&zello.url));
+    wait_for(10, "the warning", || logged(&p.messages()).contains("doesn't accept texts").then_some(()));
+    p.stop();
+}
+
+#[test]
+fn the_test_button_posts_where_the_alert_would() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let alert = json!({ "name": "Cathlamet Fire/EMS", "signals": ["sys1:CATH"], "toStream": true, "channels": ["District 4"] });
+    let p = Running::start(with_alerts(&zello.url, json!([alert.clone()])));
+    p.status_saying("Page alerts → District 4: connected", 15);
+    p.status_saying("Test → Test Channel: connected", 5);
+    p.send(action(5, alert.clone()));
+    let r = action_result(&p, 5, 15);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(r["message"].as_str().unwrap().contains("'Test Channel'"), "{r}");
+    assert!(r["message"].as_str().unwrap().contains("'District 4'"), "{r}");
+    let texts = zello.commands("send_text_message");
+    assert_eq!(texts.len(), 2);
+    assert!(texts.iter().all(|t| t["text"] == "🔔 Test: Page for Cathlamet Fire/EMS"));
+
+    // A channel added but not saved yet: says so.
+    let mut unsaved = alert;
+    unsaved["channels"] = json!(["District 4", "Puget Island"]);
+    p.send(action(6, unsaved));
+    let r = action_result(&p, 6, 5);
+    assert_eq!(r["ok"], false);
+    assert!(r["message"].as_str().unwrap().contains("'Puget Island' isn't in the saved settings"), "{r}");
+    p.stop();
+}
+
+#[test]
+fn the_test_button_says_when_zello_refuses() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { texts: Some(true), ..Default::default() });
+    let alert = json!({ "name": "Cathlamet", "signals": ["sys1:CATH"], "toStream": true });
+    let mut v = work(&zello.url);
+    v["alerts"] = json!([alert.clone()]);
+    let p = Running::start(v);
+    p.status_saying("connected", 10);
+    p.send(action(7, alert));
+    let r = action_result(&p, 7, 15);
+    assert_eq!(r["ok"], false);
+    assert!(r["message"].as_str().unwrap().contains("not allowed"), "{r}");
+    p.stop();
+}
+
+#[test]
+fn a_dropped_transmission_says_what_it_waited_behind() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let mut v = work(&zello.url);
+    v["streams"][0]["talkgroup"] = json!(null); // every talkgroup
+    v["streams"][0]["maxWaitS"] = json!(1);
+    let p = Running::start(v);
+    p.status_saying("connected", 10);
+    transmission(&p, 50, 101, 3.0); // takes the channel for 3 s
+    transmission(&p, 51, 102, 0.5); // has to wait behind it
+    p.status_saying("1 failed", 10);
+    let (said, _) = p.stop();
+    assert!(logged(&said).contains("talkgroup 102 waited over 1 s behind talkgroup 101"), "{}", logged(&said));
+}
+
+#[test]
+fn max_wait_and_the_test_button_are_in_the_form() {
+    let m = serde_json::to_value(trunk_recorder_plugin::describe::<TrProZello>()).unwrap();
+    let stream = &m["config"]["properties"]["streams"]["items"]["properties"];
+    assert_eq!(stream["maxWaitS"]["default"], 10);
+    let alert = &m["config"]["properties"]["alerts"]["items"];
+    assert_eq!(alert["x-actions"][0]["id"], "test");
+    assert_eq!(config(json!({})).streams.len(), 0);
+    let s: StreamConfig = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(s.max_wait_s, 10, "a stream saved before this setting existed waits 10 s");
 }
