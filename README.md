@@ -18,7 +18,11 @@ Encrypted calls are never sent.
 **Page alerts:** when the recorder hears a page it knows (one of a system's signals), the plugin can
 post "🔔 Page for <name>" to the stream's channel, and to other channels with an alert account
 (Zello Work lets one account join several; consumer Zello, one). Press **Zello alert** on a signal
-in Setup to add one.
+in Setup to add one, and **Send a test** on an alert to see it posted. The log says what happened to
+every alert: posted, refused (and why), or not answered.
+
+**Max wait:** each stream drops a transmission that has waited longer than this (10 s unless you
+change it) for its turn, rather than send it late. The log says which talkgroup it waited behind.
 
 ## What it needs
 
