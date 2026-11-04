@@ -1,22 +1,27 @@
 //! tr-pro-zello — a Trunk Recorder Pro plugin that streams live radio audio
 //! to Zello channels, on consumer Zello or Zello Work.
 //!
-//! This version logs each stream's account on to its Zello channel, keeps it
-//! connected, and shows how each is doing next to the plugin. It also counts
-//! the transmissions each stream will send once audio is added.
+//! Each stream logs a Zello account on to a channel and keeps it connected.
+//! Its system's talkgroup (or all of the system) goes to the channel live, a
+//! transmission at a time, and how each stream is doing shows next to the
+//! plugin and on its dashboard.
 
+mod audio;
 mod token;
 mod zello;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use trunk_recorder_plugin::{CallInfo, Endpoint, EndpointState, Host, Manifest, Metrics, NoConfig, Plugin, Setup, State, topic};
+use trunk_recorder_plugin::{
+    AudioChunk, CallInfo, ConcludedCall, Endpoint, EndpointState, Host, Manifest, Metrics, NoConfig, Outcome, Plugin, Setup, State, topic,
+};
 
 use token::TokenMaker;
-use zello::{Link, LinkConfig, LinkState};
+use zello::{Cmd, Event, Link, LinkConfig, LinkState};
 
 /// Which Zello.
 #[derive(Serialize, Deserialize, JsonSchema, Default, Clone, Copy, PartialEq, Debug)]
@@ -166,6 +171,8 @@ fn network_name(raw: &str) -> Result<String, String> {
 struct Board {
     streams: Vec<Entry>,
     shown: String,
+    /// Calls sent (or not), waiting to be matched with their recording to report them.
+    pending: HashMap<(usize, u32), Pending>,
 }
 
 struct Entry {
@@ -173,6 +180,25 @@ struct Entry {
     channel: String,
     state: LinkState,
     heard: u64,
+    sent: u64,
+    failed: u64,
+    queued: usize,
+    streaming: bool,
+    /// From a call's start to Zello taking it, ms, smoothed.
+    delay_ms: Option<f64>,
+    last_ok: Option<f64>,
+    last_error: Option<(f64, String)>,
+}
+
+#[derive(Default)]
+struct Pending {
+    since: Option<Instant>,
+    path: Option<String>,
+    result: Option<(Outcome, String, Duration)>,
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
 impl Board {
@@ -180,11 +206,18 @@ impl Board {
         let doing = match &e.state {
             LinkState::Connecting => "connecting".to_string(),
             LinkState::LoggedOn => "logged in, waiting for the channel".to_string(),
+            LinkState::Online { users } if e.streaming => format!("sending, {users} online"),
             LinkState::Online { users } => format!("connected, {users} online"),
             LinkState::Down(why) | LinkState::Refused(why) => why.clone(),
         };
-        let heard = if e.heard > 0 { format!(" · {} heard", e.heard) } else { String::new() };
-        format!("{} → {}: {doing}{heard}", e.name, e.channel)
+        let mut counts = Vec::new();
+        for (n, what) in [(e.heard, "heard"), (e.sent, "sent"), (e.failed, "failed")] {
+            if n > 0 {
+                counts.push(format!("{n} {what}"));
+            }
+        }
+        let counts = if counts.is_empty() { String::new() } else { format!(" · {}", counts.join(" · ")) };
+        format!("{} → {}: {doing}{counts}", e.name, e.channel)
     }
 
     /// Shows the status and metrics, when they changed.
@@ -208,6 +241,7 @@ impl Board {
             .map(|e| Endpoint {
                 name: format!("Zello: {}", e.channel),
                 state: match e.state {
+                    LinkState::Online { .. } if e.failed > 0 && e.last_error.as_ref().map(|x| x.0) > e.last_ok => EndpointState::Degraded,
                     LinkState::Online { .. } => EndpointState::Up,
                     LinkState::Down(_) | LinkState::Refused(_) => EndpointState::Down,
                     _ => EndpointState::Unknown,
@@ -215,10 +249,35 @@ impl Board {
                 ..Default::default()
             })
             .collect();
-        let heard: u64 = self.streams.iter().map(|e| e.heard).sum();
-        let mut m = Metrics { endpoints, ..Default::default() };
-        m.extra.insert("transmissions heard".into(), heard.into());
+        let sum = |f: fn(&Entry) -> u64| self.streams.iter().map(f).sum::<u64>();
+        let delays: Vec<f64> = self.streams.iter().filter_map(|e| e.delay_ms).collect();
+        let last_error = self.streams.iter().filter_map(|e| e.last_error.clone()).max_by(|a, b| a.0.total_cmp(&b.0));
+        let mut m = Metrics {
+            endpoints,
+            queued: Some(self.streams.iter().map(|e| e.queued as u64).sum()),
+            in_flight: Some(self.streams.iter().filter(|e| e.streaming).count() as u64),
+            latency_ms: (!delays.is_empty()).then(|| delays.iter().sum::<f64>() / delays.len() as f64),
+            last_ok: self.streams.iter().filter_map(|e| e.last_ok).max_by(f64::total_cmp),
+            last_error: last_error.as_ref().map(|x| x.0),
+            last_error_text: last_error.map(|x| x.1).unwrap_or_default(),
+            ..Default::default()
+        };
+        m.extra.insert("transmissions heard".into(), sum(|e| e.heard).into());
+        m.extra.insert("transmissions sent".into(), sum(|e| e.sent).into());
+        m.extra.insert("transmissions failed".into(), sum(|e| e.failed).into());
         host.metrics(&m);
+    }
+
+    /// Reports a call once both its result and its recording are known.
+    fn settle(&mut self, host: &Host, key: (usize, u32)) {
+        let ready = self.pending.get(&key).is_some_and(|p| p.path.is_some() && p.result.is_some());
+        if ready {
+            let p = self.pending.remove(&key).expect("checked");
+            let (outcome, why, took) = p.result.expect("checked");
+            host.call_result_took(p.path.as_deref().expect("checked"), outcome, why, "", took);
+        }
+        // Calls that were never recorded have nothing to report against.
+        self.pending.retain(|_, p| p.since.is_none_or(|t| t.elapsed() < Duration::from_secs(600)));
     }
 }
 
@@ -234,6 +293,26 @@ struct TrProZello {
     board: Arc<Mutex<Board>>,
     routes: Vec<Route>,
     links: Vec<Link>,
+    /// Calls being sent, and the streams they go to.
+    calls: HashMap<u32, Vec<usize>>,
+    /// Calls that just ended, so audio arriving after its end isn't taken for a new call.
+    ended: std::collections::VecDeque<u32>,
+}
+
+impl TrProZello {
+    fn streams_for(&self, short_name: &str, talkgroup: u32) -> Vec<usize> {
+        self.routes.iter().filter(|r| r.system == short_name && r.talkgroup.is_none_or(|t| t == talkgroup)).map(|r| r.stream).collect()
+    }
+
+    /// A call starts on these streams.
+    fn begin(&mut self, call: u32, streams: Vec<usize>) {
+        let mut b = self.board.lock().unwrap();
+        for &s in &streams {
+            self.links[s].send(Cmd::Start { call });
+            b.pending.insert((s, call), Pending { since: Some(Instant::now()), ..Default::default() });
+        }
+        self.calls.insert(call, streams);
+    }
 }
 
 impl Plugin for TrProZello {
@@ -243,8 +322,7 @@ impl Plugin for TrProZello {
     fn manifest() -> Manifest {
         Manifest {
             name: "Zello".into(),
-            // Counting transmissions for now; live audio comes next.
-            subscribe: vec![topic::CALL_START.into()],
+            subscribe: vec![topic::CALL_START.into(), topic::AUDIO.into(), topic::CALL_END.into(), topic::CALL_CONCLUDED.into()],
             ..trunk_recorder_plugin::manifest!()
         }
     }
@@ -263,8 +341,24 @@ impl Plugin for TrProZello {
             Service::Work => format!("Zello Work network {}", planned[0].link.network.as_deref().unwrap_or_default()),
         };
         let board = Arc::new(Mutex::new(Board {
-            streams: planned.iter().map(|p| Entry { name: p.name.clone(), channel: p.link.channel.clone(), state: LinkState::Connecting, heard: 0 }).collect(),
+            streams: planned
+                .iter()
+                .map(|p| Entry {
+                    name: p.name.clone(),
+                    channel: p.link.channel.clone(),
+                    state: LinkState::Connecting,
+                    heard: 0,
+                    sent: 0,
+                    failed: 0,
+                    queued: 0,
+                    streaming: false,
+                    delay_ms: None,
+                    last_ok: None,
+                    last_error: None,
+                })
+                .collect(),
             shown: String::new(),
+            pending: HashMap::new(),
         }));
         board.lock().unwrap().publish(&host);
         let mut routes = Vec::new();
@@ -274,38 +368,105 @@ impl Plugin for TrProZello {
             host.info(format!("{}: {} {tg} → {service}, channel '{}', as {}", p.name, p.system, p.link.channel, p.link.username));
             routes.push(Route { system: p.system, talkgroup: p.talkgroup, stream: i });
             let (h, b) = (host.clone(), board.clone());
-            let report: zello::Report = Arc::new(move |state: LinkState| {
+            let report: zello::Report = Arc::new(move |event: Event| {
                 let mut b = b.lock().unwrap();
                 let e = &mut b.streams[i];
-                match &state {
-                    LinkState::Online { users } if !matches!(e.state, LinkState::Online { .. }) => {
-                        h.info(format!("{}: connected to Zello channel '{}' ({users} online)", e.name, e.channel));
+                match event {
+                    Event::State(state) => {
+                        match &state {
+                            LinkState::Online { users } if !matches!(e.state, LinkState::Online { .. }) => {
+                                h.info(format!("{}: connected to Zello channel '{}' ({users} online)", e.name, e.channel));
+                            }
+                            LinkState::Down(why) | LinkState::Refused(why) => h.warn(format!("{}: {why}", e.name)),
+                            _ => {}
+                        }
+                        e.state = state;
                     }
-                    LinkState::Down(why) | LinkState::Refused(why) => h.warn(format!("{}: {why}", e.name)),
-                    _ => {}
+                    Event::Load { queued, streaming } => (e.queued, e.streaming) = (queued, streaming),
+                    Event::Note(text) => h.warn(format!("{}: {text}", e.name)),
+                    Event::Done { call, outcome, why, took, waited } => {
+                        match outcome {
+                            Outcome::Ok => {
+                                e.sent += 1;
+                                e.last_ok = Some(unix_now());
+                                let ms = waited.as_secs_f64() * 1000.0;
+                                e.delay_ms = Some(e.delay_ms.map_or(ms, |d| d * 0.8 + ms * 0.2));
+                            }
+                            Outcome::Failed => {
+                                e.failed += 1;
+                                e.last_error = Some((unix_now(), why.clone()));
+                                h.warn(format!("{}: a transmission wasn't sent: {why}", e.name));
+                            }
+                            Outcome::Skipped => {}
+                        }
+                        let p = b.pending.entry((i, call)).or_default();
+                        p.result = Some((outcome, why, took));
+                        b.settle(&h, (i, call));
+                    }
                 }
-                e.state = state;
                 b.publish(&h);
             });
             links.push(Link::start(p.link, report));
         }
-        Ok(TrProZello { host, board, routes, links })
+        Ok(TrProZello { host, board, routes, links, calls: HashMap::new(), ended: Default::default() })
     }
 
     fn call_start(&mut self, call: CallInfo) {
         if call.encrypted {
             return;
         }
-        let mut b = self.board.lock().unwrap();
-        let mut hit = false;
-        for r in &self.routes {
-            if r.system == call.short_name && r.talkgroup.is_none_or(|t| t == call.talkgroup) {
-                b.streams[r.stream].heard += 1;
-                hit = true;
+        let streams = self.streams_for(&call.short_name, call.talkgroup);
+        if streams.is_empty() {
+            return;
+        }
+        {
+            let mut b = self.board.lock().unwrap();
+            for &s in &streams {
+                b.streams[s].heard += 1;
+            }
+            b.publish(&self.host);
+        }
+        self.begin(call.id, streams);
+    }
+
+    fn audio(&mut self, chunk: AudioChunk) {
+        if !self.calls.contains_key(&chunk.call_id) {
+            if self.ended.contains(&chunk.call_id) {
+                return;
+            }
+            // A call whose start this plugin didn't see (heard on several sites, or
+            // the plugin restarted mid-call): route it by its system and talkgroup.
+            let streams = self.streams_for(&chunk.short_name, chunk.talkgroup);
+            if streams.is_empty() {
+                return;
+            }
+            self.begin(chunk.call_id, streams);
+        }
+        let samples = chunk.samples();
+        for &s in &self.calls[&chunk.call_id] {
+            self.links[s].send(Cmd::Audio { call: chunk.call_id, rate: chunk.sample_rate, samples: samples.clone() });
+        }
+    }
+
+    fn call_end(&mut self, call: CallInfo) {
+        if let Some(streams) = self.calls.remove(&call.id) {
+            for s in streams {
+                self.links[s].send(Cmd::End { call: call.id });
+            }
+            self.ended.push_back(call.id);
+            if self.ended.len() > 64 {
+                self.ended.pop_front();
             }
         }
-        if hit {
-            b.publish(&self.host);
+    }
+
+    fn call_concluded(&mut self, call: ConcludedCall) {
+        let Ok(id) = u32::try_from(call.call.call_num) else { return };
+        let mut b = self.board.lock().unwrap();
+        let keys: Vec<(usize, u32)> = b.pending.keys().filter(|k| k.1 == id).copied().collect();
+        for key in keys {
+            b.pending.get_mut(&key).expect("listed").path = Some(call.path.clone());
+            b.settle(&self.host, key);
         }
     }
 
