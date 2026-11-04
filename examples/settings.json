@@ -1,4 +1,10 @@
 {
-  "config": { "file": "calls.jsonl", "includeEncrypted": false },
-  "systems": { "sys1": { "label": "County" } }
+  "config": {
+    "service": "consumer",
+    "issuer": "PASTE-YOUR-ISSUER",
+    "privateKey": "-----BEGIN PRIVATE KEY-----\nPASTE-YOUR-KEY\n-----END PRIVATE KEY-----",
+    "streams": [
+      { "name": "Test", "system": "sys1", "talkgroup": 101, "channel": "My Test Channel", "username": "my-zello-user", "password": "PASTE-PASSWORD" }
+    ]
+  }
 }
