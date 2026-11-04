@@ -1,7 +1,9 @@
-# Zello Stream
+# Zello for Trunk Recorder Pro
 
 A [Trunk Recorder Pro](https://github.com/TrunkRecorder/trunk-recorder-pro) plugin that streams live
 radio audio to Zello channels, on consumer Zello or Zello Work.
+
+A community plugin: not made by, endorsed by or affiliated with Zello.
 
 **Work in progress.** It logs each stream's Zello account on to its channel, keeps it connected and
 shows how each is doing, and counts the transmissions it will send. It doesn't send audio yet.
@@ -36,8 +38,13 @@ token signed with your Private Key for consumer Zello. Nothing else, and nowhere
 ```sh
 cargo build
 cargo test
-./target/debug/zello-stream --describe
+./target/debug/tr-pro-zello --describe
 ```
+
+## See also
+
+[zellostream](https://github.com/aaknitt/zellostream), a Python script that streams audio to Zello,
+including from the original trunk-recorder through its simplestream plugin.
 
 ## License
 

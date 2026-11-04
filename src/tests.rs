@@ -88,7 +88,7 @@ fn streams_log_in_a_few_seconds_apart() {
 
 #[test]
 fn the_settings_form() {
-    let m = trunk_recorder_plugin::describe::<ZelloStream>();
+    let m = trunk_recorder_plugin::describe::<TrProZello>();
     let m = serde_json::to_value(m).unwrap();
     let props = &m["config"]["properties"];
     assert_eq!(props["privateKey"]["x-secret"], true);
@@ -98,7 +98,7 @@ fn the_settings_form() {
     assert_eq!(stream["password"]["x-secret"], true);
     assert_eq!(stream["system"]["x-system"], true);
     assert!(props.get("server").is_none(), "the test-only address isn't in the form");
-    assert_eq!(m["id"], "zello-stream");
+    assert_eq!(m["id"], "tr-pro-zello");
 }
 
 // ---- a stand-in Zello ----
@@ -202,8 +202,8 @@ impl Running {
         let (tx, rx) = channel();
         let said = Said::default();
         let host = Host::to_writer(said.clone());
-        let thread = std::thread::spawn(move || trunk_recorder_plugin::serve::<ZelloStream>(BufReader::new(Lines { rx, buf: Vec::new(), pos: 0 }), host));
-        let dir = testing::temp_dir("zello-stream");
+        let thread = std::thread::spawn(move || trunk_recorder_plugin::serve::<TrProZello>(BufReader::new(Lines { rx, buf: Vec::new(), pos: 0 }), host));
+        let dir = testing::temp_dir("tr-pro-zello");
         let r = Running { tx, said, thread };
         r.send(HostMessage::Hello(testing::hello(&dir, settings)));
         r

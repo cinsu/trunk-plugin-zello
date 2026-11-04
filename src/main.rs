@@ -1,4 +1,4 @@
-//! zello-stream — a Trunk Recorder Pro plugin that streams live radio audio
+//! tr-pro-zello — a Trunk Recorder Pro plugin that streams live radio audio
 //! to Zello channels, on consumer Zello or Zello Work.
 //!
 //! This version logs each stream's account on to its Zello channel, keeps it
@@ -229,20 +229,20 @@ struct Route {
     stream: usize,
 }
 
-struct ZelloStream {
+struct TrProZello {
     host: Host,
     board: Arc<Mutex<Board>>,
     routes: Vec<Route>,
     links: Vec<Link>,
 }
 
-impl Plugin for ZelloStream {
+impl Plugin for TrProZello {
     type Config = Config;
     type SystemConfig = NoConfig;
 
     fn manifest() -> Manifest {
         Manifest {
-            name: "Zello Stream".into(),
+            name: "Zello".into(),
             // Counting transmissions for now; live audio comes next.
             subscribe: vec![topic::CALL_START.into()],
             ..trunk_recorder_plugin::manifest!()
@@ -289,7 +289,7 @@ impl Plugin for ZelloStream {
             });
             links.push(Link::start(p.link, report));
         }
-        Ok(ZelloStream { host, board, routes, links })
+        Ok(TrProZello { host, board, routes, links })
     }
 
     fn call_start(&mut self, call: CallInfo) {
@@ -321,7 +321,7 @@ impl Plugin for ZelloStream {
 }
 
 fn main() {
-    trunk_recorder_plugin::run::<ZelloStream>();
+    trunk_recorder_plugin::run::<TrProZello>();
 }
 
 #[cfg(test)]

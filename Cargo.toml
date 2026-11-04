@@ -1,10 +1,10 @@
 [package]
 # Your plugin's id: lowercase letters, digits and dashes. It names the
 # executable, the release files and the plugin's entry in the registry.
-name = "zello-stream"
+name = "tr-pro-zello"
 version = "0.1.0"
 edition = "2024"
-description = "Streams live radio audio to Zello and Zello Work channels."
+description = "Streams live radio audio to Zello and Zello Work channels. A community plugin, not made by Zello."
 license = "GPL-3.0-or-later"
 repository = "https://github.com/cinsu/tr-plugin-zello"
 authors = ["Justin Roberts"]

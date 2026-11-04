@@ -148,10 +148,10 @@ fn session(cfg: &LinkConfig, stop: &AtomicBool, report: &Report, online_since: &
         "username": cfg.username,
         "password": cfg.password,
         "channels": [cfg.channel],
-        "version": concat!("zello-stream ", env!("CARGO_PKG_VERSION")),
+        "version": concat!("tr-pro-zello ", env!("CARGO_PKG_VERSION")),
         "platform_type": "trunk-recorder-pro",
         // Zello Alarms watches clients whose platform name says "Gateway".
-        "platform_name": "Zello Stream Gateway",
+        "platform_name": "Trunk Recorder Pro Gateway",
     });
     if let Some(tokens) = &cfg.tokens {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
