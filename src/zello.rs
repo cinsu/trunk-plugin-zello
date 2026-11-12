@@ -242,13 +242,13 @@ struct Pipeline {
     texts: VecDeque<Text>,
     max_wait: Duration,
     load: (usize, bool),
-    dropped: usize,
+
     noted_rate: bool,
 }
 
 impl Pipeline {
     fn new(rx: Receiver<Cmd>, max_wait: Duration) -> Pipeline {
-        Pipeline { rx, queue: VecDeque::new(), texts: VecDeque::new(), max_wait, load: (0, false), dropped: 0, noted_rate: false }
+        Pipeline { rx, queue: VecDeque::new(), texts: VecDeque::new(), max_wait, load: (0, false), noted_rate: false }
     }
 
     /// Takes what the plugin sent.
@@ -402,13 +402,17 @@ enum Sending {
         again_at: Option<Instant>,
     },
     /// Sending: `frames` sent since `clock` (moved on when audio runs short,
-    /// so a late burst isn't sent faster than real time).
+    /// so a late burst isn't sent faster than real time). `backlog`: the audio
+    /// that piled up while it waited its turn, which is all sent, from its start.
+    /// `trimmed`: audio dropped because it fell behind while sending.
     Streaming {
         id: u64,
         clock: Instant,
         frames: u64,
         began: Instant,
         waited: Duration,
+        backlog: usize,
+        trimmed: usize,
     },
 }
 
@@ -532,8 +536,9 @@ fn converse(
                 {
                     if let Some(id) = v["stream_id"].as_u64().filter(|_| v["success"] == true) {
                         let waited = pipeline.queue.front().map_or(Duration::ZERO, |t| t.created.elapsed());
+                        let backlog = pipeline.queue.front().map_or(0, |t| t.pcm.len());
                         let now = Instant::now();
-                        *sending = Sending::Streaming { id, clock: now, frames: 0, began: now, waited };
+                        *sending = Sending::Streaming { id, clock: now, frames: 0, began: now, waited, backlog, trimmed: 0 };
                     } else {
                         let err = v["error"].as_str().unwrap_or("no reason given").to_string();
                         if err == "channel busy" && *busy < BUSY_RETRIES {
@@ -644,21 +649,18 @@ fn pump(
                 *sending = Sending::Idle;
             }
         }
-        Sending::Streaming { id, clock, frames, began, waited } => {
+        Sending::Streaming { id, clock, frames, began, waited, backlog, trimmed } => {
             let Some(tx) = pipeline.queue.front_mut() else {
                 *sending = Sending::Idle;
                 return Ok(());
             };
-            if tx.pcm.len() > MAX_BEHIND {
-                let n = tx.pcm.len() - MAX_BEHIND;
+            // What waited for its turn is all sent, from the start (who's calling is at
+            // the start). Only audio falling behind on top of that, while sending, is dropped.
+            let allowed = backlog.saturating_sub(*frames as usize * audio::FRAME) + MAX_BEHIND;
+            if tx.pcm.len() > allowed {
+                let n = tx.pcm.len() - allowed;
                 tx.pcm.drain(..n);
-                pipeline.dropped += n;
-                if pipeline.dropped.is_multiple_of(audio::RATE as usize) || pipeline.dropped == n {
-                    report(Event::Note(format!(
-                        "fell over 3 s behind the radio: dropped {:.1} s of audio so far",
-                        pipeline.dropped as f64 / f64::from(audio::RATE)
-                    )));
-                }
+                *trimmed += n;
             }
             let due = clock.elapsed().as_millis() as u64 / audio::FRAME_MS + 1;
             while *frames < due {
@@ -686,6 +688,13 @@ fn pump(
             if tx.ended && tx.pcm.is_empty() {
                 ws.send(Message::text(json!({ "command": "stop_stream", "stream_id": *id }).to_string())).map_err(lost)?;
                 let call = tx.call;
+                if *trimmed > 0 {
+                    report(Event::Note(format!(
+                        "{} fell over 3 s behind the radio while it was being sent: dropped {:.1} s of it",
+                        talkgroup_name(tx.talkgroup),
+                        *trimmed as f64 / f64::from(audio::RATE)
+                    )));
+                }
                 pipeline.queue.pop_front();
                 report(Event::Done { call, outcome: Outcome::Ok, why: String::new(), took: began.elapsed(), waited: *waited });
                 *sending = Sending::Idle;
