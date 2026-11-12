@@ -70,4 +70,4 @@ including from the original trunk-recorder through its simplestream plugin.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
