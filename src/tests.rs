@@ -860,3 +860,67 @@ fn max_wait_and_the_test_button_are_in_the_form() {
     let s: StreamConfig = serde_json::from_value(json!({})).unwrap();
     assert_eq!(s.max_wait_s, 10, "a stream saved before this setting existed waits 10 s");
 }
+
+// ---- every system; audio that waited is sent whole ----
+
+#[test]
+fn every_system_is_accepted() {
+    let mut v = work("");
+    v["streams"][0]["system"] = json!("");
+    let p = plan(&config(v), &["sys1".into()]).unwrap().streams;
+    assert_eq!(p[0].system, "", "empty is Pro's Every system");
+}
+
+#[test]
+fn every_system_streams_any_systems_calls() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let mut v = work(&zello.url);
+    v["streams"][0]["system"] = json!("");
+    v["streams"][0]["talkgroup"] = json!(null);
+    let p = Running::start(v);
+    p.status_saying("connected", 10);
+    transmission(&p, 60, 777, 0.4);
+    p.status_saying("1 sent", 10);
+    let (said, _) = p.stop();
+    assert!(logged(&said).contains("Test: every system every talkgroup →"), "{}", logged(&said));
+}
+
+#[test]
+fn a_transmission_that_waited_is_sent_from_its_start() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let mut v = work(&zello.url);
+    v["streams"][0]["talkgroup"] = json!(null);
+    v["streams"][0]["maxWaitS"] = json!(30);
+    let p = Running::start(v);
+    p.status_saying("connected", 10);
+    transmission(&p, 70, 101, 5.0); // on the channel for 5 s
+    transmission(&p, 71, 102, 4.0); // waits 5 s, with 4 s of its audio piled up
+    p.status_saying("2 sent", 20);
+    let (said, _) = p.stop();
+    let packets = zello.packets().len();
+    assert!(packets >= 450, "{packets} packets: 9 s of audio is 450, so some was cut");
+    assert!(!logged(&said).contains("fell over"), "{}", logged(&said));
+}
+
+#[test]
+fn audio_falling_behind_while_sending_is_still_trimmed() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    p.send(HostMessage::CallStart(call_numbered(80, 101)));
+    let mut chunks = audio(80, 101, 6.2).into_iter();
+    for m in chunks.by_ref().take(10) {
+        p.send(m); // 0.2 s: the stream starts with almost nothing waiting
+    }
+    wait_for(5, "the stream to start", || (!zello.packets().is_empty()).then_some(()));
+    for m in chunks {
+        p.send(m); // then 6 s at once: 3 s more than real time can keep up with
+    }
+    p.send(HostMessage::CallEnd(call_numbered(80, 101)));
+    p.status_saying("1 sent", 15);
+    let (said, _) = p.stop();
+    let log = logged(&said);
+    assert!(log.contains("talkgroup 101 fell over 3 s behind the radio while it was being sent: dropped"), "{log}");
+    let packets = zello.packets().len();
+    assert!(packets < 250, "{packets} packets: the 3 s it fell behind should have been dropped");
+}

@@ -94,6 +94,8 @@ struct StreamConfig {
     /// What the status and log call it. Empty: the channel's name.
     name: String,
     /// System
+    ///
+    /// "Every system" sends all of them.
     #[schemars(extend("x-system" = true))]
     system: String,
     /// Talkgroup
@@ -205,10 +207,8 @@ fn plan(c: &Config, systems: &[String]) -> Result<Plan, String> {
     let mut planned = Vec::new();
     for (i, s) in c.streams.iter().enumerate() {
         let name = [s.name.trim(), s.channel.trim()].into_iter().find(|n| !n.is_empty()).map_or_else(|| format!("Stream {}", i + 1), str::to_string);
-        if s.system.trim().is_empty() {
-            return Err(format!("{name}: choose its system."));
-        }
-        if !systems.iter().any(|n| n == s.system.trim()) {
+        // An empty system is Pro's "Every system": the stream takes all of them.
+        if !s.system.trim().is_empty() && !systems.iter().any(|n| n == s.system.trim()) {
             return Err(format!("{name}: the recorder has no system named '{}'.", s.system.trim()));
         }
         for (value, what) in [(&s.channel, "Zello channel"), (&s.username, "Zello username"), (&s.password, "Zello password")] {
@@ -439,7 +439,7 @@ struct TrProZello {
 
 impl TrProZello {
     fn streams_for(&self, short_name: &str, talkgroup: u32) -> Vec<usize> {
-        self.routes.iter().filter(|r| r.system == short_name && r.talkgroup.is_none_or(|t| t == talkgroup)).map(|r| r.stream).collect()
+        self.routes.iter().filter(|r| (r.system.is_empty() || r.system == short_name) && r.talkgroup.is_none_or(|t| t == talkgroup)).map(|r| r.stream).collect()
     }
 
     /// A stream's (or the alert account's) channel.
@@ -539,7 +539,8 @@ impl Plugin for TrProZello {
         let mut links = Vec::new();
         for (i, p) in planned.into_iter().enumerate() {
             let tg = p.talkgroup.map_or("every talkgroup".to_string(), |t| format!("talkgroup {t}"));
-            host.info(format!("{}: {} {tg} → {service}, channel '{}', as {}", p.name, p.system, p.link.channel, p.link.username));
+            let system = if p.system.is_empty() { "every system" } else { p.system.as_str() };
+            host.info(format!("{}: {system} {tg} → {service}, channel '{}', as {}", p.name, p.link.channel, p.link.username));
             routes.push(Route { system: p.system, talkgroup: p.talkgroup, stream: i });
             links.push(Link::start(p.link, reporter(i, &host, &board)));
         }
@@ -599,8 +600,11 @@ impl Plugin for TrProZello {
         if alert.to_stream && systems.is_empty() {
             return reply.fail("Tick the page (signal) it's for first: the test goes to the streams of that page's system.");
         }
-        let to_streams: Vec<usize> =
-            if alert.to_stream { self.routes.iter().filter(|r| systems.contains(&r.system.as_str())).map(|r| r.stream).collect() } else { Vec::new() };
+        let to_streams: Vec<usize> = if alert.to_stream {
+            self.routes.iter().filter(|r| r.system.is_empty() || systems.contains(&r.system.as_str())).map(|r| r.stream).collect()
+        } else {
+            Vec::new()
+        };
         let to_channels: Vec<String> = alert.channels.iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
         if let Some(missing) = to_channels.iter().find(|c| !self.alert_channels().iter().any(|x| x.eq_ignore_ascii_case(c))) {
             return reply.fail(format!("'{missing}' isn't in the saved settings yet: save them, then test."));
