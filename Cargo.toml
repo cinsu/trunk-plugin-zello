@@ -2,7 +2,7 @@
 # Your plugin's id: lowercase letters, digits and dashes. It names the
 # executable, the release files and the plugin's entry in the registry.
 name = "tr-pro-zello"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Streams live radio audio to Zello and Zello Work channels."
 license = "MIT"

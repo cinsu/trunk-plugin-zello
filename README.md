@@ -45,7 +45,7 @@ Give each stream its own Zello account: Zello keeps one connection per account.
 | Zello service | Zello (the free app) or Zello Work |
 | Issuer, Private key | Consumer Zello only |
 | Network | Zello Work only |
-| Streams | Each: a name, the system (or every system), a talkgroup (empty: all of the system), the Zello channel, username and password |
+| Streams | Each: an On switch, a name, the system (or every system), a talkgroup (empty: all of the system), the Zello channel, username and password. The list shows one line per stream; open one to edit it. A stream switched off can be half set up: nothing is checked or connected until it's on |
 | Page alerts | Each: a name, the pages (signals) it's for, whether it posts on the stream's channel, and other channels to post to |
 | Alert account | The username and password that post alerts to other channels |
 

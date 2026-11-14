@@ -88,7 +88,13 @@ struct Config {
 /// Stream
 #[derive(Serialize, Deserialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend("x-title" = "name", "x-summary" = ["{channel|no channel yet}", "talkgroup {talkgroup|all}", "{system|every system}"]))]
 struct StreamConfig {
+    /// On
+    ///
+    /// Off: the stream stays here, set up or half set up, but doesn't connect
+    /// or send. Turn streams on as they're ready.
+    enabled: bool,
     /// Name
     ///
     /// What the status and log call it. Empty: the channel's name.
@@ -125,6 +131,7 @@ struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         StreamConfig {
+            enabled: true,
             name: String::new(),
             system: String::new(),
             talkgroup: None,
@@ -180,6 +187,8 @@ struct Plan {
     alerts: Vec<Alert>,
     /// The alert account's connection, when alerts go to other channels.
     alert_link: Option<LinkConfig>,
+    /// Streams that are switched off, by name.
+    off: Vec<String>,
 }
 
 /// A stream, checked and ready to connect.
@@ -205,8 +214,14 @@ fn plan(c: &Config, systems: &[String]) -> Result<Plan, String> {
         (None, _) => "wss://zello.io/ws".to_string(),
     };
     let mut planned = Vec::new();
+    let mut off = Vec::new();
     for (i, s) in c.streams.iter().enumerate() {
         let name = [s.name.trim(), s.channel.trim()].into_iter().find(|n| !n.is_empty()).map_or_else(|| format!("Stream {}", i + 1), str::to_string);
+        if !s.enabled {
+            // Staged: nothing is checked or connected until it's turned on.
+            off.push(name);
+            continue;
+        }
         // An empty system is Pro's "Every system": the stream takes all of them.
         if !s.system.trim().is_empty() && !systems.iter().any(|n| n == s.system.trim()) {
             return Err(format!("{name}: the recorder has no system named '{}'.", s.system.trim()));
@@ -229,7 +244,7 @@ fn plan(c: &Config, systems: &[String]) -> Result<Plan, String> {
                 tokens: tokens.clone(),
                 network: network.clone(),
                 // Zello limits logins that come all at once.
-                start_delay: Duration::from_secs(3 * i as u64),
+                start_delay: Duration::from_secs(3 * planned.len() as u64),
                 max_wait: Duration::from_secs(u64::from(s.max_wait_s.clamp(1, 300))),
             },
         });
@@ -278,7 +293,7 @@ fn plan(c: &Config, systems: &[String]) -> Result<Plan, String> {
             max_wait: Duration::from_secs(10),
         })
     };
-    Ok(Plan { streams: planned, alerts, alert_link })
+    Ok(Plan { streams: planned, alerts, alert_link, off })
 }
 
 /// "wahkiakum", from what people paste: "Wahkiakum", "wahkiakum.zellowork.com", a URL.
@@ -303,6 +318,8 @@ fn network_name(raw: &str) -> Result<String, String> {
 struct Board {
     streams: Vec<Entry>,
     shown: String,
+    /// How many streams are switched off, for the status line.
+    off: usize,
     /// Calls sent (or not), waiting to be matched with their recording to report them.
     pending: HashMap<(usize, u32), Pending>,
 }
@@ -363,7 +380,11 @@ impl Board {
         } else {
             State::Ok
         };
-        let text = self.streams.iter().map(Board::line).collect::<Vec<_>>().join("; ");
+        let mut text = self.streams.iter().map(Board::line).collect::<Vec<_>>().join("; ");
+        if self.off > 0 {
+            let off = if self.off == 1 { "1 stream off".to_string() } else { format!("{} streams off", self.off) };
+            text = if text.is_empty() { "All streams are off".to_string() } else { format!("{text}; {off}") };
+        }
         if text == self.shown {
             return;
         }
@@ -498,7 +519,10 @@ impl Plugin for TrProZello {
 
     fn start(host: Host, setup: Setup<Config, NoConfig>) -> Result<Self, String> {
         let systems: Vec<String> = setup.systems.iter().map(|s| s.short_name.clone()).collect();
-        let Plan { streams: planned, alerts, alert_link } = plan(&setup.config, &systems)?;
+        let Plan { streams: planned, alerts, alert_link, off } = plan(&setup.config, &systems)?;
+        for name in &off {
+            host.info(format!("{name}: off"));
+        }
         let users: Vec<&str> = planned.iter().map(|p| p.link.username.as_str()).collect();
         for (i, u) in users.iter().enumerate() {
             if users[..i].contains(u) {
@@ -507,7 +531,7 @@ impl Plugin for TrProZello {
         }
         let service = match setup.config.service {
             Service::Consumer => "Zello".to_string(),
-            Service::Work => format!("Zello Work network {}", planned[0].link.network.as_deref().unwrap_or_default()),
+            Service::Work => format!("Zello Work network {}", network_name(&setup.config.network).unwrap_or_default()),
         };
         let mut entries: Vec<(String, String)> = planned.iter().map(|p| (p.name.clone(), p.link.channel.clone())).collect();
         if let Some(l) = &alert_link {
@@ -532,6 +556,7 @@ impl Plugin for TrProZello {
                 })
                 .collect(),
             shown: String::new(),
+            off: off.len(),
             pending: HashMap::new(),
         }));
         board.lock().unwrap().publish(&host);
