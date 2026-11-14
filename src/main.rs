@@ -1,4 +1,4 @@
-//! tr-pro-zello — a Trunk Recorder Pro plugin that streams live radio audio
+//! trunk-plugin-zello — a Trunk Recorder Pro plugin that streams live radio audio
 //! to Zello channels, on consumer Zello or Zello Work.
 //!
 //! Each stream logs a Zello account on to a channel and keeps it connected.
@@ -296,7 +296,7 @@ fn plan(c: &Config, systems: &[String]) -> Result<Plan, String> {
     Ok(Plan { streams: planned, alerts, alert_link, off })
 }
 
-/// "wahkiakum", from what people paste: "Wahkiakum", "wahkiakum.zellowork.com", a URL.
+/// "example", from what people paste: "Example", "example.zellowork.com", a URL.
 fn network_name(raw: &str) -> Result<String, String> {
     let mut n = raw.trim().to_lowercase();
     for prefix in ["https://", "http://"] {
@@ -444,7 +444,7 @@ struct Route {
     stream: usize,
 }
 
-struct TrProZello {
+struct ZelloStreaming {
     host: Host,
     board: Arc<Mutex<Board>>,
     routes: Vec<Route>,
@@ -458,7 +458,7 @@ struct TrProZello {
     ended: std::collections::VecDeque<u32>,
 }
 
-impl TrProZello {
+impl ZelloStreaming {
     fn streams_for(&self, short_name: &str, talkgroup: u32) -> Vec<usize> {
         self.routes.iter().filter(|r| (r.system.is_empty() || r.system == short_name) && r.talkgroup.is_none_or(|t| t == talkgroup)).map(|r| r.stream).collect()
     }
@@ -497,13 +497,13 @@ impl TrProZello {
     }
 }
 
-impl Plugin for TrProZello {
+impl Plugin for ZelloStreaming {
     type Config = Config;
     type SystemConfig = NoConfig;
 
     fn manifest() -> Manifest {
         Manifest {
-            name: "Zello".into(),
+            name: "Zello Streaming".into(),
             subscribe: vec![topic::CALL_START.into(), topic::AUDIO.into(), topic::CALL_END.into(), topic::CALL_CONCLUDED.into(), topic::TONE_PATTERN.into()],
             // A button on each of a system's signals in Setup: adds a page alert for it.
             contribute: vec![Contribution {
@@ -582,7 +582,7 @@ impl Plugin for TrProZello {
             }
             host.info(format!("Page alert {}: {} → {}", a.name, a.signals.join(", "), to.join(", ")));
         }
-        Ok(TrProZello { host, board, routes, links, alerts, alert_link, calls: HashMap::new(), ended: Default::default() })
+        Ok(ZelloStreaming { host, board, routes, links, alerts, alert_link, calls: HashMap::new(), ended: Default::default() })
     }
 
     fn tone_pattern(&mut self, t: TonePatternEvent) {
@@ -787,13 +787,13 @@ fn reporter(i: usize, host: &Host, board: &Arc<Mutex<Board>>) -> zello::Report {
     })
 }
 
-/// "District 4" or "3 channels".
+/// "District 2" or "3 channels".
 fn channels_label(l: &LinkConfig) -> String {
     if l.also.is_empty() { l.channel.clone() } else { format!("{} channels", l.also.len() + 1) }
 }
 
 fn main() {
-    trunk_recorder_plugin::run::<TrProZello>();
+    trunk_recorder_plugin::run::<ZelloStreaming>();
 }
 
 #[cfg(test)]

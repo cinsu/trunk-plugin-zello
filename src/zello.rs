@@ -524,7 +524,7 @@ fn converse(
         "username": cfg.username,
         "password": cfg.password,
         "channels": channels(cfg),
-        "version": concat!("tr-pro-zello ", env!("CARGO_PKG_VERSION")),
+        "version": concat!("trunk-plugin-zello ", env!("CARGO_PKG_VERSION")),
         "platform_type": "trunk-recorder-pro",
         // Zello Alarms watches clients whose platform name says "Gateway".
         "platform_name": "Trunk Recorder Pro Gateway",
