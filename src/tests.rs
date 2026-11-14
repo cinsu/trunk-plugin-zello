@@ -13,7 +13,7 @@ use trunk_recorder_plugin::{AudioChunk, HostMessage, TonePattern, TonePatternEve
 const PASSWORD: &str = "pw-very-secret";
 
 fn stream(talkgroup: Option<u32>) -> Value {
-    json!({ "name": "Test", "system": "sys1", "talkgroup": talkgroup, "channel": "Test Channel", "username": "gw-test", "password": PASSWORD })
+    json!({ "name": "Test", "system": "sys1", "talkgroup": talkgroup, "channel": "Test Channel", "username": "stream-test", "password": PASSWORD })
 }
 
 fn work(server: &str) -> Value {
@@ -72,8 +72,8 @@ fn addresses_for_each_service() {
 
 #[test]
 fn network_names_as_people_paste_them() {
-    assert_eq!(network_name(" Wahkiakum ").unwrap(), "wahkiakum");
-    assert_eq!(network_name("https://wahkiakum.zellowork.com/").unwrap(), "wahkiakum");
+    assert_eq!(network_name(" Example ").unwrap(), "example");
+    assert_eq!(network_name("https://example.zellowork.com/").unwrap(), "example");
     assert!(network_name("my network").is_err());
 }
 
@@ -88,7 +88,7 @@ fn streams_log_in_a_few_seconds_apart() {
 
 #[test]
 fn the_settings_form() {
-    let m = trunk_recorder_plugin::describe::<TrProZello>();
+    let m = trunk_recorder_plugin::describe::<ZelloStreaming>();
     let m = serde_json::to_value(m).unwrap();
     let props = &m["config"]["properties"];
     assert_eq!(props["privateKey"]["x-secret"], true);
@@ -98,7 +98,7 @@ fn the_settings_form() {
     assert_eq!(stream["password"]["x-secret"], true);
     assert_eq!(stream["system"]["x-system"], true);
     assert!(props.get("server").is_none(), "the test-only address isn't in the form");
-    assert_eq!(m["id"], "tr-pro-zello");
+    assert_eq!(m["id"], "trunk-plugin-zello");
 }
 
 // ---- a stand-in Zello ----
@@ -297,8 +297,8 @@ impl Running {
         let (tx, rx) = channel();
         let said = Said::default();
         let host = Host::to_writer(said.clone());
-        let thread = std::thread::spawn(move || trunk_recorder_plugin::serve::<TrProZello>(BufReader::new(Lines { rx, buf: Vec::new(), pos: 0 }), host));
-        let dir = testing::temp_dir("tr-pro-zello");
+        let thread = std::thread::spawn(move || trunk_recorder_plugin::serve::<ZelloStreaming>(BufReader::new(Lines { rx, buf: Vec::new(), pos: 0 }), host));
+        let dir = testing::temp_dir("trunk-plugin-zello");
         let r = Running { tx, said, thread };
         r.send(HostMessage::Hello(testing::hello(&dir, settings)));
         r
@@ -402,7 +402,7 @@ fn zello_work_connects_and_counts_transmissions() {
     assert_eq!(code, 0);
     let logon = &zello.logons()[0];
     assert_eq!(logon["command"], "logon");
-    assert_eq!(logon["username"], "gw-test");
+    assert_eq!(logon["username"], "stream-test");
     assert_eq!(logon["password"], PASSWORD);
     assert_eq!(logon["channels"], json!(["Test Channel"]));
     assert!(logon.get("auth_token").is_none(), "Zello Work takes no token");
@@ -660,7 +660,7 @@ fn live_audio_is_never_sent_faster_than_real_time() {
 fn with_alerts(server: &str, alerts: Value) -> Value {
     let mut v = work(server);
     v["alerts"] = alerts;
-    v["alertUsername"] = json!("gw-alerts");
+    v["alertUsername"] = json!("alert-poster");
     v["alertPassword"] = json!(PASSWORD);
     v
 }
@@ -687,8 +687,8 @@ fn alert_settings_are_checked() {
         }
         plan_err(v)
     };
-    assert!(err(json!([{ "name": "Cathlamet" }]), "work").contains("tick the page"));
-    assert!(err(json!([{ "name": "Cathlamet", "signals": ["sys1:CATH"], "toStream": false }]), "work").contains("add a channel"));
+    assert!(err(json!([{ "name": "Station 1" }]), "work").contains("tick the page"));
+    assert!(err(json!([{ "name": "Station 1", "signals": ["sys1:STA1"], "toStream": false }]), "work").contains("add a channel"));
     let two = json!([{ "name": "A", "signals": ["sys1:A"], "channels": ["One", "Two"] }]);
     assert!(err(two, "consumer").contains("one channel at a time"));
     let mut v = with_alerts("", json!([{ "name": "A", "signals": ["sys1:A"], "channels": ["One"] }]));
@@ -704,7 +704,7 @@ fn alert_settings_are_checked() {
 
 #[test]
 fn the_zello_alert_button() {
-    let m = serde_json::to_value(trunk_recorder_plugin::describe::<TrProZello>()).unwrap();
+    let m = serde_json::to_value(trunk_recorder_plugin::describe::<ZelloStreaming>()).unwrap();
     assert!(m["subscribe"].as_array().unwrap().contains(&json!("tone_pattern")));
     let c = &m["contribute"][0];
     assert_eq!(c["on"], "signal");
@@ -718,22 +718,22 @@ fn the_zello_alert_button() {
 #[test]
 fn a_page_posts_to_the_stream_and_other_channels() {
     let zello = FakeZello::start(|l| (welcome(l), false));
-    let alerts = json!([{ "name": "Cathlamet Fire/EMS", "signals": ["sys1:CATH"], "channels": ["District 4", "Skamokawa"] }]);
+    let alerts = json!([{ "name": "Station 1 Fire/EMS", "signals": ["sys1:STA1"], "channels": ["District 2", "District 3"] }]);
     let p = Running::start(with_alerts(&zello.url, alerts));
     p.status_saying("Page alerts → 2 channels: connected", 15);
     p.status_saying("Test → Test Channel: connected", 5);
-    p.send(page(101, &["CATH"]));
+    p.send(page(101, &["STA1"]));
     p.status_saying("Page alerts → 2 channels: connected, 6 online · 2 pages posted", 10);
     let (said, _) = p.stop();
     let texts = zello.commands("send_text_message");
     let mut to: Vec<&str> = texts.iter().map(|t| t["channel"].as_str().unwrap()).collect();
     to.sort();
-    assert_eq!(to, ["District 4", "Skamokawa", "Test Channel"]);
-    assert!(texts.iter().all(|t| t["text"] == "🔔 Page for Cathlamet Fire/EMS"));
+    assert_eq!(to, ["District 2", "District 3", "Test Channel"]);
+    assert!(texts.iter().all(|t| t["text"] == "🔔 Page for Station 1 Fire/EMS"));
     // The alert account joined both channels in one login; the stream's account just its own.
     let logons = zello.logons();
-    let alerts_logon = logons.iter().find(|l| l["username"] == "gw-alerts").unwrap();
-    assert_eq!(alerts_logon["channels"], json!(["District 4", "Skamokawa"]));
+    let alerts_logon = logons.iter().find(|l| l["username"] == "alert-poster").unwrap();
+    assert_eq!(alerts_logon["channels"], json!(["District 2", "District 3"]));
     assert_no_secrets(&said);
 }
 
@@ -741,12 +741,12 @@ fn a_page_posts_to_the_stream_and_other_channels() {
 fn other_pages_post_nothing() {
     let zello = FakeZello::start(|l| (welcome(l), false));
     let mut v = work(&zello.url);
-    v["alerts"] = json!([{ "name": "Cathlamet Fire/EMS", "signals": ["sys1:CATH"] }]);
+    v["alerts"] = json!([{ "name": "Station 1 Fire/EMS", "signals": ["sys1:STA1"] }]);
     let p = Running::start(v);
     p.status_saying("connected", 10);
     p.send(page(101, &["SKAM"])); // another page
     p.send(page(101, &[])); // a page the recorder doesn't know
-    p.send(page(102, &["CATH"])); // on a talkgroup no stream carries: no stream channel to post to
+    p.send(page(102, &["STA1"])); // on a talkgroup no stream carries: no stream channel to post to
     std::thread::sleep(Duration::from_millis(500));
     p.stop();
     assert!(zello.commands("send_text_message").is_empty());
@@ -782,17 +782,17 @@ fn action_result(p: &Running, request: u64, secs: u64) -> Value {
 fn every_page_alert_is_logged() {
     let zello = FakeZello::start(|l| (welcome(l), false));
     let mut v = work(&zello.url);
-    v["alerts"] = json!([{ "name": "Cathlamet Fire/EMS", "signals": ["sys1:CATH"] }]);
+    v["alerts"] = json!([{ "name": "Station 1 Fire/EMS", "signals": ["sys1:STA1"] }]);
     let p = Running::start(v);
     p.status_saying("connected", 10);
-    p.send(page(101, &["CATH"]));
+    p.send(page(101, &["STA1"]));
     p.status_saying("1 page posted", 10);
-    p.send(page(102, &["CATH"])); // no stream carries 102
+    p.send(page(102, &["STA1"])); // no stream carries 102
     std::thread::sleep(Duration::from_millis(300));
     let (said, _) = p.stop();
     let log = logged(&said);
-    assert!(log.contains("Page heard: Cathlamet Fire/EMS on sys1 talkgroup 101 → 'Test Channel'"), "{log}");
-    assert!(log.contains("posting \"🔔 Page for Cathlamet Fire/EMS\" to 'Test Channel'"), "{log}");
+    assert!(log.contains("Page heard: Station 1 Fire/EMS on sys1 talkgroup 101 → 'Test Channel'"), "{log}");
+    assert!(log.contains("posting \"🔔 Page for Station 1 Fire/EMS\" to 'Test Channel'"), "{log}");
     assert!(log.contains("page alert posted to 'Test Channel'"), "{log}");
     assert!(log.contains("talkgroup 102, but there's nowhere to post it"), "{log}");
 }
@@ -801,10 +801,10 @@ fn every_page_alert_is_logged() {
 fn zello_not_answering_a_page_alert_is_logged() {
     let zello = FakeZello::talking(|l| (welcome(l), false), Talk { texts: Some(false), ..Default::default() });
     let mut v = work(&zello.url);
-    v["alerts"] = json!([{ "name": "Cathlamet", "signals": ["sys1:CATH"] }]);
+    v["alerts"] = json!([{ "name": "Station 1", "signals": ["sys1:STA1"] }]);
     let p = Running::start(v);
     p.status_saying("connected", 10);
-    p.send(page(101, &["CATH"]));
+    p.send(page(101, &["STA1"]));
     wait_for(15, "the no-answer warning", || logged(&p.messages()).contains("Zello didn't answer within 10 s").then_some(()));
     p.stop();
 }
@@ -813,10 +813,10 @@ fn zello_not_answering_a_page_alert_is_logged() {
 fn zello_refusing_a_page_alert_is_logged() {
     let zello = FakeZello::talking(|l| (welcome(l), false), Talk { texts: Some(true), ..Default::default() });
     let mut v = work(&zello.url);
-    v["alerts"] = json!([{ "name": "Cathlamet", "signals": ["sys1:CATH"] }]);
+    v["alerts"] = json!([{ "name": "Station 1", "signals": ["sys1:STA1"] }]);
     let p = Running::start(v);
     p.status_saying("connected", 10);
-    p.send(page(101, &["CATH"]));
+    p.send(page(101, &["STA1"]));
     wait_for(10, "the refusal", || logged(&p.messages()).contains("wasn't posted to 'Test Channel': Zello wouldn't post it (not allowed)").then_some(()));
     p.stop();
 }
@@ -836,33 +836,33 @@ fn a_channel_without_texts_is_pointed_out() {
 #[test]
 fn the_test_button_posts_where_the_alert_would() {
     let zello = FakeZello::start(|l| (welcome(l), false));
-    let alert = json!({ "name": "Cathlamet Fire/EMS", "signals": ["sys1:CATH"], "toStream": true, "channels": ["District 4"] });
+    let alert = json!({ "name": "Station 1 Fire/EMS", "signals": ["sys1:STA1"], "toStream": true, "channels": ["District 2"] });
     let p = Running::start(with_alerts(&zello.url, json!([alert.clone()])));
-    p.status_saying("Page alerts → District 4: connected", 15);
+    p.status_saying("Page alerts → District 2: connected", 15);
     p.status_saying("Test → Test Channel: connected", 5);
     p.send(action(5, alert.clone()));
     let r = action_result(&p, 5, 15);
     assert_eq!(r["ok"], true, "{r}");
     assert!(r["message"].as_str().unwrap().contains("'Test Channel'"), "{r}");
-    assert!(r["message"].as_str().unwrap().contains("'District 4'"), "{r}");
+    assert!(r["message"].as_str().unwrap().contains("'District 2'"), "{r}");
     let texts = zello.commands("send_text_message");
     assert_eq!(texts.len(), 2);
-    assert!(texts.iter().all(|t| t["text"] == "🔔 Test: Page for Cathlamet Fire/EMS"));
+    assert!(texts.iter().all(|t| t["text"] == "🔔 Test: Page for Station 1 Fire/EMS"));
 
     // A channel added but not saved yet: says so.
     let mut unsaved = alert;
-    unsaved["channels"] = json!(["District 4", "Puget Island"]);
+    unsaved["channels"] = json!(["District 2", "District 5"]);
     p.send(action(6, unsaved));
     let r = action_result(&p, 6, 5);
     assert_eq!(r["ok"], false);
-    assert!(r["message"].as_str().unwrap().contains("'Puget Island' isn't in the saved settings"), "{r}");
+    assert!(r["message"].as_str().unwrap().contains("'District 5' isn't in the saved settings"), "{r}");
     p.stop();
 }
 
 #[test]
 fn the_test_button_says_when_zello_refuses() {
     let zello = FakeZello::talking(|l| (welcome(l), false), Talk { texts: Some(true), ..Default::default() });
-    let alert = json!({ "name": "Cathlamet", "signals": ["sys1:CATH"], "toStream": true });
+    let alert = json!({ "name": "Station 1", "signals": ["sys1:STA1"], "toStream": true });
     let mut v = work(&zello.url);
     v["alerts"] = json!([alert.clone()]);
     let p = Running::start(v);
@@ -891,7 +891,7 @@ fn a_dropped_transmission_says_what_it_waited_behind() {
 
 #[test]
 fn max_wait_and_the_test_button_are_in_the_form() {
-    let m = serde_json::to_value(trunk_recorder_plugin::describe::<TrProZello>()).unwrap();
+    let m = serde_json::to_value(trunk_recorder_plugin::describe::<ZelloStreaming>()).unwrap();
     let stream = &m["config"]["properties"]["streams"]["items"]["properties"];
     assert_eq!(stream["maxWaitS"]["default"], 10);
     let alert = &m["config"]["properties"]["alerts"]["items"];
@@ -1010,14 +1010,14 @@ fn a_stream_switched_off_is_not_connected() {
     let mut staged = stream(Some(102));
     staged["enabled"] = json!(false);
     staged["name"] = json!("Staged");
-    staged["username"] = json!("gw-staged");
+    staged["username"] = json!("stream-staged");
     v["streams"] = json!([stream(Some(101)), staged]);
     let p = Running::start(v);
     p.status_saying("Test → Test Channel: connected, 3 online; 1 stream off", 10);
     transmission(&p, 90, 102, 0.3); // the staged stream's talkgroup: nothing goes out
     std::thread::sleep(Duration::from_millis(500));
     let (said, _) = p.stop();
-    assert!(zello.logons().iter().all(|l| l["username"] != "gw-staged"), "the staged stream never logs in");
+    assert!(zello.logons().iter().all(|l| l["username"] != "stream-staged"), "the staged stream never logs in");
     assert!(zello.commands("start_stream").is_empty());
     assert!(logged(&said).contains("Staged: off"), "{}", logged(&said));
 }
@@ -1052,7 +1052,7 @@ fn streams_saved_before_the_switch_are_on() {
 
 #[test]
 fn the_stream_list_is_collapsed_with_a_switch() {
-    let m = serde_json::to_value(trunk_recorder_plugin::describe::<TrProZello>()).unwrap();
+    let m = serde_json::to_value(trunk_recorder_plugin::describe::<ZelloStreaming>()).unwrap();
     assert_eq!(m["version"], "0.2.0");
     let item = &m["config"]["properties"]["streams"]["items"];
     assert_eq!(item["x-title"], "name");

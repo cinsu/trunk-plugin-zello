@@ -477,7 +477,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tr-pro-zello"
+name = "trunk-plugin-zello"
 version = "0.2.0"
 dependencies = [
  "base64",

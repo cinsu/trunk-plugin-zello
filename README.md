@@ -1,11 +1,9 @@
-# Zello for Trunk Recorder Pro
+# Zello Streaming for Trunk Recorder Pro
 
 A [Trunk Recorder Pro](https://github.com/TrunkRecorder/trunk-recorder-pro) plugin that streams live
 radio audio to Zello channels, on consumer Zello or Zello Work.
 
-A community plugin: not made by, endorsed by or affiliated with Zello.
-
-**Work in progress**, not released yet.
+A community plugin: not made by, endorsed by or affiliated with Zello. Zello is a trademark of Zello Inc.
 
 Each stream logs a Zello account on to a channel and sends a system's talkgroup (or all of the
 system) to it live: each transmission as it's heard, one at a time, as 48 kHz Opus. When the
@@ -28,6 +26,14 @@ One that does get its turn is sent whole, from its start, a little behind the ra
 **Connection:** each stream pings Zello every 20 s while it's quiet, so an idle connection isn't
 dropped along the way, and a dead one is replaced before anything needs sending. A transmission cut
 off by a lost connection is sent again, from its start, once reconnected (once; within Max wait).
+
+## Installing
+
+In Trunk Recorder Pro, open **Plugins**, find **Zello Streaming** in the store and install it. Then fill in its
+settings and turn it on. Updates show there as **Update available**; settings carry over.
+
+Builds for Linux (x86_64 and ARM64, such as a Raspberry Pi with a 64-bit OS), macOS and Windows are on the
+[releases page](https://github.com/cinsu/trunk-plugin-zello/releases).
 
 ## What it needs
 
@@ -65,7 +71,7 @@ their traffic to be streamed.
 ```sh
 cargo build
 cargo test
-./target/debug/tr-pro-zello --describe
+./target/debug/trunk-plugin-zello --describe
 ```
 
 ## See also

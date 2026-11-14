@@ -1,12 +1,12 @@
 [package]
 # Your plugin's id: lowercase letters, digits and dashes. It names the
 # executable, the release files and the plugin's entry in the registry.
-name = "tr-pro-zello"
+name = "trunk-plugin-zello"
 version = "0.2.0"
 edition = "2024"
 description = "Streams live radio audio to Zello and Zello Work channels."
 license = "MIT"
-repository = "https://github.com/cinsu/tr-plugin-zello"
+repository = "https://github.com/cinsu/trunk-plugin-zello"
 authors = ["Justin Roberts"]
 publish = false
 

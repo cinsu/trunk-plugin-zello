@@ -1,5 +1,5 @@
 //! Audio for Zello: the recorder's voice (8 kHz) up to 48 kHz, then Opus,
-//! the way the Wahkiakum connector did it, which Zello's apps play well.
+//! the way the Node connector this plugin replaced did it, which Zello's apps play well.
 
 use std::collections::VecDeque;
 use std::f64::consts::PI;
