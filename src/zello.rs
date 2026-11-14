@@ -37,6 +37,12 @@ const FIRST_RETRY: Duration = Duration::from_secs(2);
 const MAX_RETRY: Duration = Duration::from_secs(60);
 /// After Zello refuses a login, wait this long before trying again.
 const REFUSED_RETRY: Duration = Duration::from_secs(300);
+/// While nothing is coming from Zello, ping it this often. That keeps an idle
+/// connection from being dropped silently along the way, and shows when it was.
+const PING_EVERY: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(20) };
+/// Nothing at all from Zello for this long, once it has answered a ping on this
+/// connection: the connection is dead, so reconnect before anything needs sending.
+const DEAD_AFTER: Duration = if cfg!(test) { Duration::from_millis(700) } else { Duration::from_secs(50) };
 
 /// How a connection is doing.
 #[derive(Clone, Debug, PartialEq)]
@@ -189,12 +195,45 @@ struct Tx {
     up: Option<Upsampler>,
     /// 48 kHz audio waiting to be sent.
     pcm: VecDeque<i16>,
+    /// What this attempt has sent so far, kept so it can be sent again from its
+    /// start if the connection drops partway through.
+    sent: Vec<i16>,
+    /// It was cut off once and is being sent again (only once).
+    retried: bool,
+    /// When it lost its connection; it may wait Max wait from then for the next.
+    retry_since: Option<Instant>,
 }
 
 impl Tx {
     fn new(call: u32, talkgroup: u32) -> Tx {
         let now = Instant::now();
-        Tx { call, talkgroup, created: now, last_audio: now, ended: false, rate: 0, up: None, pcm: VecDeque::new() }
+        Tx {
+            call,
+            talkgroup,
+            created: now,
+            last_audio: now,
+            ended: false,
+            rate: 0,
+            up: None,
+            pcm: VecDeque::new(),
+            sent: Vec::new(),
+            retried: false,
+            retry_since: None,
+        }
+    }
+
+    /// When it started waiting for its turn: its start, or when it was cut off.
+    fn waiting_since(&self) -> Instant {
+        self.retry_since.unwrap_or(self.created)
+    }
+
+    /// Cut off by a lost connection: put back what was sent, to send it all again.
+    fn restart(&mut self) {
+        let mut all: VecDeque<i16> = self.sent.drain(..).collect();
+        all.append(&mut self.pcm);
+        self.pcm = all;
+        self.retried = true;
+        self.retry_since = Some(Instant::now());
     }
 
     fn end(&mut self) {
@@ -298,7 +337,7 @@ impl Pipeline {
         let skip = usize::from(front_busy);
         let mut i = skip;
         while i < self.queue.len() {
-            if self.queue[i].created.elapsed() > self.max_wait {
+            if self.queue[i].waiting_since().elapsed() > self.max_wait {
                 let tx = self.queue.remove(i).expect("in range");
                 let waited = tx.created.elapsed();
                 let behind = match self.queue.front() {
@@ -433,17 +472,32 @@ fn session(
     let mut ws = open(cfg)?;
     let mut sending = Sending::Idle;
     let mut texts_sent = HashMap::new();
-    let result = converse(cfg, stop, report, online_since, pipeline, encoder, &mut ws, &mut sending, &mut texts_sent);
+    let mut last_heard = Instant::now();
+    let result = converse(cfg, stop, report, online_since, pipeline, encoder, &mut ws, &mut sending, &mut texts_sent, &mut last_heard);
+    // Say how long Zello had been quiet: a long quiet before a drop points at an idle connection cut along the way.
+    let result = result.map_err(|f| match f {
+        Failure::Down(why) => Failure::Down(format!("{why}; last heard from Zello {} s before", last_heard.elapsed().as_secs())),
+        other => other,
+    });
     for (_, t) in texts_sent.drain() {
         t.done(Err("the connection to Zello was lost before it answered".into()), Some(&cfg.channel), report);
     }
-    if !matches!(sending, Sending::Idle) {
-        // Cut off mid-transmission: that one is lost.
-        if let Some(tx) = pipeline.queue.pop_front() {
+    if !matches!(sending, Sending::Idle)
+        && let Some(tx) = pipeline.queue.front_mut()
+    {
+        if result.is_err() && !tx.retried {
+            // Cut off by the connection: send it again, from its start, once reconnected.
+            tx.restart();
+            report(Event::Info(format!(
+                "the connection to Zello was lost while sending {}; it will be sent again from its start once reconnected",
+                talkgroup_name(tx.talkgroup)
+            )));
+        } else {
             let why = match &result {
                 Ok(()) => "the plugin stopped while sending it",
-                Err(_) => "the connection to Zello was lost while sending it",
+                Err(_) => "the connection to Zello was lost while sending it, twice",
             };
+            let tx = pipeline.queue.pop_front().expect("front");
             report(Event::Done { call: tx.call, outcome: Outcome::Failed, why: why.into(), took: Duration::ZERO, waited: tx.created.elapsed() });
         }
     }
@@ -462,6 +516,7 @@ fn converse(
     ws: &mut WebSocket<Conn>,
     sending: &mut Sending,
     texts_sent: &mut HashMap<u64, Text>,
+    last_heard: &mut Instant,
 ) -> Result<(), Failure> {
     let mut logon = json!({
         "command": "logon",
@@ -486,6 +541,11 @@ fn converse(
     // Channels online, with their users; texts sent, by seq, to their channel.
     let mut joined: HashMap<String, u64> = HashMap::new();
     let mut noted_no_texts = false;
+    // Keepalive: pings sent while quiet; whether Zello has answered one on this connection.
+    let mut last_ping = Instant::now();
+    let mut pings = 0u32;
+    let mut pong_seen = false;
+    let mut noted_no_pong = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = ws.close(None);
@@ -493,7 +553,12 @@ fn converse(
             return Ok(());
         }
         pipeline.take(report);
-        match ws.read() {
+        let read = ws.read();
+        if read.is_ok() {
+            *last_heard = Instant::now();
+        }
+        match read {
+            Ok(Message::Pong(_)) => pong_seen = true,
             Ok(Message::Text(text)) => {
                 let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                 if v["seq"] == 1 {
@@ -569,6 +634,18 @@ fn converse(
         }
         if !logged_on && asked.elapsed() > LOGON_TIMEOUT {
             return Err(Failure::Down("Zello didn't answer the login".into()));
+        }
+        if logged_on && last_heard.elapsed() >= PING_EVERY && last_ping.elapsed() >= PING_EVERY {
+            ws.send(Message::Ping(Default::default())).map_err(lost)?;
+            last_ping = Instant::now();
+            pings += 1;
+        }
+        if pong_seen && last_heard.elapsed() > DEAD_AFTER {
+            return Err(Failure::Down(format!("Zello stopped answering (nothing for {} s, pings unanswered)", last_heard.elapsed().as_secs())));
+        }
+        if !pong_seen && !noted_no_pong && pings >= 3 {
+            noted_no_pong = true;
+            report(Event::Note("Zello isn't answering keepalive pings, so a dropped connection is only noticed when something is sent".into()));
         }
         let streaming = !matches!(sending, Sending::Idle);
         if online {
@@ -667,14 +744,15 @@ fn pump(
                 let frame: Vec<i16> = if tx.pcm.len() >= audio::FRAME {
                     tx.pcm.drain(..audio::FRAME).collect()
                 } else if tx.ended && !tx.pcm.is_empty() {
-                    let mut f: Vec<i16> = tx.pcm.drain(..).collect();
-                    f.resize(audio::FRAME, 0);
-                    f
+                    tx.pcm.drain(..).collect()
                 } else {
                     // Out of audio for now: hold the clock, so what comes next isn't sent too fast.
                     *clock = Instant::now() - Duration::from_millis(*frames * audio::FRAME_MS);
                     break;
                 };
+                tx.sent.extend_from_slice(&frame);
+                let mut frame = frame;
+                frame.resize(audio::FRAME, 0);
                 let opus = encoder.encode(&frame).map_err(Failure::Down)?;
                 // {type 1 = audio, stream id, packet id (0)}, big-endian, then the Opus packet.
                 let mut packet = Vec::with_capacity(9 + opus.len());

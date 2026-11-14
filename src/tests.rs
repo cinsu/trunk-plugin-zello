@@ -116,6 +116,10 @@ struct Talk {
     texts: Option<bool>,
     /// Hang up after this many audio packets.
     hang_up_after: Option<usize>,
+    /// Hang up every connection after this many of its own audio packets.
+    hang_up_every: Option<usize>,
+    /// Stop reading (and so answering pings) this long after the login, keeping the connection open.
+    quiet_after: Option<Duration>,
 }
 
 const STREAM_ID: u64 = 4242;
@@ -125,6 +129,7 @@ struct Heard {
     logons: Vec<Value>,
     commands: Vec<Value>,
     packets: Vec<(Instant, Vec<u8>)>,
+    pings: usize,
 }
 
 struct FakeZello {
@@ -160,8 +165,23 @@ impl FakeZello {
                         return;
                     }
                     let mut busy = talk.busy;
-                    while let Ok(m) = ws.read() {
+                    let mut mine = 0;
+                    let since = Instant::now();
+                    if talk.quiet_after.is_some() {
+                        let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(20)));
+                    }
+                    loop {
+                        if talk.quiet_after.is_some_and(|d| since.elapsed() > d) {
+                            std::thread::sleep(Duration::from_secs(30)); // holds the connection, says nothing
+                            return;
+                        }
+                        let m = match ws.read() {
+                            Ok(m) => m,
+                            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                            Err(_) => break,
+                        };
                         match m {
+                            tungstenite::Message::Ping(_) => log.lock().unwrap().pings += 1,
                             tungstenite::Message::Text(t) => {
                                 let v: Value = serde_json::from_str(&t).unwrap();
                                 log.lock().unwrap().commands.push(v.clone());
@@ -190,7 +210,8 @@ impl FakeZello {
                                     h.packets.push((Instant::now(), b.to_vec()));
                                     h.packets.len()
                                 };
-                                if talk.hang_up_after == Some(n) {
+                                mine += 1;
+                                if talk.hang_up_after == Some(n) || talk.hang_up_every == Some(mine) {
                                     return; // drops the connection
                                 }
                             }
@@ -213,6 +234,10 @@ impl FakeZello {
 
     fn packets(&self) -> Vec<(Instant, Vec<u8>)> {
         self.heard.lock().unwrap().packets.clone()
+    }
+
+    fn pings(&self) -> usize {
+        self.heard.lock().unwrap().pings
     }
 }
 
@@ -562,19 +587,34 @@ fn only_its_own_talkgroup_and_nothing_encrypted() {
 }
 
 #[test]
-fn a_dropped_connection_fails_the_transmission_and_reconnects() {
+fn a_dropped_connection_sends_the_transmission_again_from_its_start() {
     let zello = FakeZello::talking(|l| (welcome(l), false), Talk { hang_up_after: Some(10), ..Default::default() });
     let p = Running::start(work(&zello.url));
     p.status_saying("connected", 10);
     transmission(&p, 12, 101, 1.0);
-    p.status_saying("1 failed", 10);
-    let end = Instant::now() + Duration::from_secs(10);
-    while zello.logons().len() < 2 {
-        assert!(Instant::now() < end, "it never logged in again");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    p.status_saying("1 sent", 15);
     let (said, _) = p.stop();
-    assert_eq!(results(&said), vec![("sys1/2026/11/4/101-12".to_string(), "failed".to_string())]);
+    assert_eq!(zello.logons().len(), 2, "logged in again");
+    assert_eq!(zello.commands("start_stream").len(), 2);
+    // 10 packets on the first try, then all 1 s (50 packets, plus the filter's tail) again.
+    let n = zello.packets().len();
+    assert!((60..=62).contains(&n), "{n} packets");
+    assert_eq!(results(&said), vec![("sys1/2026/11/4/101-12".to_string(), "ok".to_string())]);
+    let log = logged(&said);
+    assert!(log.contains("it will be sent again from its start once reconnected"), "{log}");
+    assert!(log.contains("last heard from Zello"), "{log}");
+}
+
+#[test]
+fn a_transmission_cut_off_twice_fails() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { hang_up_every: Some(10), ..Default::default() });
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    transmission(&p, 13, 101, 1.0);
+    p.status_saying("1 failed", 15);
+    let (said, _) = p.stop();
+    assert_eq!(results(&said), vec![("sys1/2026/11/4/101-13".to_string(), "failed".to_string())]);
+    assert!(logged(&said).contains("lost while sending it, twice"), "{}", logged(&said));
 }
 
 #[test]
@@ -923,4 +963,40 @@ fn audio_falling_behind_while_sending_is_still_trimmed() {
     assert!(log.contains("talkgroup 101 fell over 3 s behind the radio while it was being sent: dropped"), "{log}");
     let packets = zello.packets().len();
     assert!(packets < 250, "{packets} packets: the 3 s it fell behind should have been dropped");
+}
+
+// ---- keepalive ----
+
+#[test]
+fn an_idle_connection_is_kept_alive_with_pings() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    std::thread::sleep(Duration::from_millis(1500));
+    let (said, _) = p.stop();
+    assert!(zello.pings() >= 4, "{} pings", zello.pings());
+    assert_eq!(zello.logons().len(), 1, "answered pings: no reconnecting");
+    assert!(!logged(&said).contains("isn't answering keepalive"));
+}
+
+#[test]
+fn a_connection_that_goes_silent_is_replaced_before_it_is_needed() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { quiet_after: Some(Duration::from_millis(600)), ..Default::default() });
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    wait_for(10, "a new login", || (zello.logons().len() >= 2).then_some(()));
+    let (said, _) = p.stop();
+    assert!(logged(&said).contains("Zello stopped answering"), "{}", logged(&said));
+}
+
+#[test]
+fn a_zello_that_never_answers_pings_is_noted_not_dropped() {
+    let zello = FakeZello::talking(|l| (welcome(l), false), Talk { quiet_after: Some(Duration::ZERO), ..Default::default() });
+    let p = Running::start(work(&zello.url));
+    p.status_saying("connected", 10);
+    wait_for(10, "the note", || logged(&p.messages()).contains("isn't answering keepalive pings").then_some(()));
+    std::thread::sleep(Duration::from_millis(1500));
+    let (said, _) = p.stop();
+    assert!(!logged(&said).contains("stopped answering"), "{}", logged(&said));
+    assert_eq!(zello.logons().len(), 1, "never answered a ping, so silence alone isn't taken as a dead connection");
 }

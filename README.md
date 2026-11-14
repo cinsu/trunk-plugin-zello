@@ -25,6 +25,10 @@ every alert: posted, refused (and why), or not answered.
 change it) for its turn, rather than send it late. The log says which talkgroup it waited behind.
 One that does get its turn is sent whole, from its start, a little behind the radio.
 
+**Connection:** each stream pings Zello every 20 s while it's quiet, so an idle connection isn't
+dropped along the way, and a dead one is replaced before anything needs sending. A transmission cut
+off by a lost connection is sent again, from its start, once reconnected (once; within Max wait).
+
 ## What it needs
 
 - **Consumer Zello:** an Issuer and Private Key from [developers.zello.com](https://developers.zello.com)
