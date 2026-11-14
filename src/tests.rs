@@ -1000,3 +1000,63 @@ fn a_zello_that_never_answers_pings_is_noted_not_dropped() {
     assert!(!logged(&said).contains("stopped answering"), "{}", logged(&said));
     assert_eq!(zello.logons().len(), 1, "never answered a ping, so silence alone isn't taken as a dead connection");
 }
+
+// ---- streams switched off; the collapsed list ----
+
+#[test]
+fn a_stream_switched_off_is_not_connected() {
+    let zello = FakeZello::start(|l| (welcome(l), false));
+    let mut v = work(&zello.url);
+    let mut staged = stream(Some(102));
+    staged["enabled"] = json!(false);
+    staged["name"] = json!("Staged");
+    staged["username"] = json!("gw-staged");
+    v["streams"] = json!([stream(Some(101)), staged]);
+    let p = Running::start(v);
+    p.status_saying("Test → Test Channel: connected, 3 online; 1 stream off", 10);
+    transmission(&p, 90, 102, 0.3); // the staged stream's talkgroup: nothing goes out
+    std::thread::sleep(Duration::from_millis(500));
+    let (said, _) = p.stop();
+    assert!(zello.logons().iter().all(|l| l["username"] != "gw-staged"), "the staged stream never logs in");
+    assert!(zello.commands("start_stream").is_empty());
+    assert!(logged(&said).contains("Staged: off"), "{}", logged(&said));
+}
+
+#[test]
+fn a_stream_switched_off_can_be_half_set_up() {
+    let mut v = work("");
+    v["streams"] = json!([stream(Some(101)), { "enabled": false, "name": "Later", "system": "not-yet-there" }]);
+    let p = plan(&config(v), &["sys1".into()]).unwrap();
+    assert_eq!(p.streams.len(), 1);
+    assert_eq!(p.off, vec!["Later".to_string()]);
+}
+
+#[test]
+fn every_stream_off_still_runs() {
+    let mut v = work("");
+    let mut s = stream(Some(101));
+    s["enabled"] = json!(false);
+    v["streams"] = json!([s]);
+    let p = Running::start(v);
+    let (state, text) = p.status_saying("All streams are off", 5);
+    assert_eq!(state, "ok", "{text}");
+    let (_, code) = p.stop();
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn streams_saved_before_the_switch_are_on() {
+    let s: StreamConfig = serde_json::from_value(json!({ "name": "Old", "system": "sys1", "channel": "c", "username": "u", "password": "p" })).unwrap();
+    assert!(s.enabled);
+}
+
+#[test]
+fn the_stream_list_is_collapsed_with_a_switch() {
+    let m = serde_json::to_value(trunk_recorder_plugin::describe::<TrProZello>()).unwrap();
+    assert_eq!(m["version"], "0.2.0");
+    let item = &m["config"]["properties"]["streams"]["items"];
+    assert_eq!(item["x-title"], "name");
+    assert_eq!(item["x-summary"], json!(["{channel|no channel yet}", "talkgroup {talkgroup|all}", "{system|every system}"]));
+    assert_eq!(item["properties"]["enabled"]["type"], "boolean");
+    assert_eq!(item["properties"]["enabled"]["default"], true);
+}
